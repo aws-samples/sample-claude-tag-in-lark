@@ -217,6 +217,10 @@ proves function-calling survives the gateway→Bedrock path. Only then continue.
    - `LarkSecretsArn` → the ARN of the secret you just created
    - `AgentRuntimeArn` → the Runtime ARN from Step 4
    - `LarkOpenBase` → `https://open.larksuite.com` (or the CN base)
+   - `AgentCoreMemoryId` → the Memory id from Step 1 (same value as the runtime
+     secret's `AGENTCORE_MEMORY_ID`) — the ambient consolidator writes into it
+   - `MemorySemanticStrategyId` → the SEMANTIC strategy id from Step 1 (same value
+     as `MEMORY_SEMANTIC_STRATEGY_ID`)
 
 3. Build and deploy:
 
@@ -227,8 +231,14 @@ proves function-calling survives the gateway→Bedrock path. Only then continue.
    Besides the webhook Lambda + HTTP API, this stack also creates the
    scheduled-tasks infrastructure: the **DynamoDB** table `lark-claude-tag-schedules`,
    the **dispatcher** Lambda, and the **EventBridge** `rate(1 minute)` heartbeat
-   that fires it. Note the **`WebhookUrl`** and **`SchedulesTableArn`** outputs
-   (the latter is what you scope the Runtime's DynamoDB inline policy to in Step 5).
+   that fires it. It likewise creates the **ambient-consolidation** infrastructure:
+   the **DynamoDB** cursor table `lark-claude-tag-consolidation`, the
+   **consolidator** Lambda, and a separate **EventBridge** `rate(1 hour)` sweep that
+   distills non-@ group messages into per-channel memory. The consolidator runs
+   under its own SAM-managed role and writes to the Memory ARN built from the
+   `AgentCoreMemoryId` parameter, so it needs no extra IAM wiring on the Runtime
+   role. Note the **`WebhookUrl`** and **`SchedulesTableArn`** outputs (the latter
+   is what you scope the Runtime's DynamoDB inline policy to in Step 5).
 
 4. (Optional) Smoke-test Runtime connectivity from the Lambda, without any Lark
    calls:

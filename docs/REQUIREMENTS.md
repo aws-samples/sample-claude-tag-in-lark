@@ -20,7 +20,7 @@ The table maps Claude Tag's described capabilities to what this sample implement
 |---|------------|---------------------------|-------------|
 | 1 | **@-mention delegation** | @Claude in a channel; it decomposes the task → uses tools → replies in-thread. One shared Claude per channel; collaborative, can hand off. | **Implemented** |
 | 2 | **Channel memory** | Learns from the channel, remembers key facts so you don't re-explain; with permission can learn across channels/data sources (private channels stay private). | **Implemented** (isolated per channel; no learning across channels it hasn't been added to) |
-| 3 | **Ambient mode** (off by default) | Listens to the whole channel without being @-mentioned; proactively nudges and follows up on unfinished threads. | Future |
+| 3 | **Ambient mode** (off by default) | Listens to the whole channel without being @-mentioned; proactively nudges and follows up on unfinished threads. | **Partial — ambient perception**: an hourly consolidator sweeps the messages a chat received *without* @-mentioning the bot (since it was first used there) and conservatively distills the durable facts among them (decisions, roles, commitments, stable preferences — chatter dropped) into that channel's memory, tagged `[群聊旁听]`. Perception only; proactive nudges and unprompted follow-ups remain Future. |
 | 4 | **Async + self-scheduling** | Runs delegated work in the background for hours/days; schedules its own tasks. | **Implemented (self-scheduling)**: from a chat instruction the bot creates one-shot / recurring / count- or deadline-bounded jobs (`remind` posts text, `agent` runs a turn), fired by a 1-minute EventBridge heartbeat over a DynamoDB registry. Multi-hour background execution is out of scope. |
 | 5 | **DM / private chat** | Replies privately in DMs using personal tools/connectors. | Future |
 | 6 | **Distinct identity** | Its own identity, with permissions and memory scoped per channel. | Partial (the bot has its own tenant identity; memory is isolated by `chat_id`) |
@@ -43,6 +43,10 @@ The table maps Claude Tag's described capabilities to what this sample implement
    jobs are read back for confirmation before creation, and stop exactly on their
    count/deadline. `list_tasks` / `cancel_task` work; guardrails reject sub-minute
    intervals and over-long/over-frequent jobs.
+6. Ambient consolidation: messages a chat received without @-mentioning the bot are
+   swept hourly, the durable facts among them are distilled into that channel's
+   memory (chatter filtered out, source-tagged `[群聊旁听]`), and the sweep cursor
+   advances; a chat with no new messages is a no-op.
 
 ## Key technical constraints
 

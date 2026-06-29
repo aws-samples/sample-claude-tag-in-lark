@@ -44,6 +44,12 @@ practices and standards.
    heartbeat fire each due job: `remind` mode posts the text, `agent` mode runs a
    full turn. Fired jobs @-mention their creator; `list_tasks` / `cancel_task`
    manage them. Guardrails cap interval/count/horizon to prevent spam.
+7. **Ambient group perception** — between @-mentions, an hourly job sweeps the
+   messages a group sent *without* @-mentioning the bot and conservatively distills
+   the durable facts among them (decisions, roles, commitments — chatter dropped)
+   into that channel's memory, source-tagged `[群聊旁听]`. No new messages → no-op.
+   This is perception only: the bot still speaks only when @-mentioned, but an
+   @-mention now lands with the channel's recent context already in memory.
 
 ## Architecture
 
@@ -51,8 +57,11 @@ practices and standards.
 
 <sub>Reactive path (gray): @-mention → API Gateway → webhook Lambda →
 AgentCore Runtime → model/memory/skills/tools → SSE → CardKit reply.
-Scheduling path (green): EventBridge heartbeat → dispatcher → claim due jobs in
-DynamoDB → ask the webhook to deliver. Diagram source: `docs/architecture.py`.</sub>
+Scheduling path (green): 1-minute EventBridge heartbeat → dispatcher → claim due
+jobs in DynamoDB → ask the webhook to deliver.
+Ambient path (blue): hourly EventBridge → consolidator → pull non-@ messages from
+Lark → distill durable facts into per-channel memory. Diagram source:
+`docs/architecture.py`.</sub>
 
 | Layer | Path |
 |-------|------|
@@ -61,6 +70,7 @@ DynamoDB → ask the webhook to deliver. Diagram source: `docs/architecture.py`.
 | Memory integration | `larkclaudetag/app/larktag/memory.py` (+ `infra/agentcore/create_memory.py`) |
 | Self-evolving skills | `larkclaudetag/app/larktag/skill_store.py` (S3-backed) |
 | Scheduled tasks / reminders | agent tools `larkclaudetag/app/larktag/schedule.py`; heartbeat `functions/dispatcher/`; DynamoDB + EventBridge in `template.yaml` |
+| Ambient consolidation | hourly sweep `functions/consolidator/`; per-chat cursor DynamoDB + `rate(1 hour)` EventBridge in `template.yaml` |
 | Infra | `template.yaml` (Lambda/APIGW/DynamoDB/EventBridge SAM), `larkclaudetag/agentcore/` (AgentCore CDK) |
 
 The Lambda is a thin webhook adapter (verify/decrypt/dedup/ack/async); all agent

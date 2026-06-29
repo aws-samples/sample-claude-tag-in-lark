@@ -27,6 +27,10 @@ graph_attr = {
 }
 edge_attr = {"fontsize": "11"}
 
+# One color per flow so the three paths read apart at a glance.
+SCHED = "darkgreen"   # scheduling: 1-minute heartbeat
+AMBIENT = "#1565C0"   # ambient consolidation: hourly sweep
+
 with Diagram(
     "lark-claude-tag — architecture",
     filename="docs/architecture",
@@ -39,7 +43,7 @@ with Diagram(
 
     with Cluster("Model & external"):
         litellm = EC2("LiteLLM gateway\n(EKS)")
-        bedrock = Bedrock("Bedrock\nClaude Opus 4.8")
+        bedrock = Bedrock("Bedrock\nClaude Opus 4.8 + Haiku")
         exa = Client("Exa · AWS Knowledge\n(MCP)")
         litellm >> Edge(label="Anthropic /v1/messages") >> bedrock
 
@@ -53,14 +57,19 @@ with Diagram(
             memory = Database("AgentCore Memory\nper-channel facts")
             skills = S3("S3\nlearned skills")
 
-        with Cluster("Scheduling (heartbeat)"):
+        with Cluster("Scheduling (1-min heartbeat)"):
             eventbridge = Eventbridge("EventBridge\nrate(1 minute)")
             dispatcher = Lambda("Dispatcher\nclaim & deliver due jobs")
             schedules = Dynamodb("DynamoDB\nschedules")
 
+        with Cluster("Ambient consolidation (hourly)"):
+            eb_hourly = Eventbridge("EventBridge\nrate(1 hour)")
+            consolidator = Lambda("Consolidator\ndistill non-@ messages")
+            cursor = Dynamodb("DynamoDB\nsweep cursor")
+
         secrets = SecretsManager("Secrets Manager\nruntime + Lark creds")
 
-    # --- Reactive path: @-mention -> reply ---
+    # --- Reactive path (gray): @-mention -> reply ---
     lark >> Edge(label="im.message.receive_v1") >> apigw >> webhook
     webhook >> Edge(label="invoke_agent_runtime\n(session = chat_id)") >> runtime
     runtime >> Edge(label="model calls") >> litellm
@@ -70,12 +79,21 @@ with Diagram(
     runtime >> Edge(label="SSE deltas", style="dashed") >> webhook
     webhook >> Edge(label="CardKit reply (in thread)", style="dashed") >> lark
 
-    # --- Scheduling path: heartbeat -> deliver ---
-    runtime >> Edge(label="schedule_task / list / cancel", color="darkgreen") >> schedules
-    eventbridge >> Edge(color="darkgreen") >> dispatcher
-    dispatcher >> Edge(label="query due", color="darkgreen") >> schedules
-    dispatcher >> Edge(label="_scheduled_task", color="darkgreen") >> webhook
+    # --- Scheduling path (green): heartbeat -> deliver ---
+    runtime >> Edge(label="schedule_task / list / cancel", color=SCHED) >> schedules
+    eventbridge >> Edge(color=SCHED) >> dispatcher
+    dispatcher >> Edge(label="query due", color=SCHED) >> schedules
+    dispatcher >> Edge(label="_scheduled_task", color=SCHED) >> webhook
+
+    # --- Ambient path (blue): hourly sweep -> distill non-@ chatter into memory ---
+    webhook >> Edge(label="enroll chat (first use)", color=AMBIENT, style="dashed") >> cursor
+    eb_hourly >> Edge(color=AMBIENT) >> consolidator
+    consolidator >> Edge(label="read / advance cursor", color=AMBIENT) >> cursor
+    consolidator >> Edge(label="pull non-@ messages", color=AMBIENT) >> lark
+    consolidator >> Edge(label="distill (Haiku)", color=AMBIENT) >> bedrock
+    consolidator >> Edge(label="write distilled facts", color=AMBIENT) >> memory
 
     # --- Config (no secrets in the image) ---
     webhook >> Edge(style="dotted", color="gray") >> secrets
     runtime >> Edge(style="dotted", color="gray") >> secrets
+    consolidator >> Edge(style="dotted", color="gray") >> secrets
