@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# AWS SAM
+.aws-sam/
+samconfig.local.toml
+
+# AgentCore / Docker build
+agent/.bedrock_agentcore/
+*.tar
+
+# agentcore CLI project (larkclaudetag/) — ignore heavy/generated bits
+node_modules/
+larkclaudetag/agentcore/cdk/cdk.out/
+larkclaudetag/agentcore/.cli/
+
+# Secrets / local config — NEVER commit
+.env
+*.local
+secrets/
+**/credentials.json
+
+# Vendored Anthropic document-skills (Proprietary license) — NOT redistributed.
+# Kept on disk for local image builds; must be populated before `agentcore deploy`.
+# See larkclaudetag/app/larktag/skills/README.md.
+larkclaudetag/app/larktag/skills/docx/
+larkclaudetag/app/larktag/skills/pptx/
+larkclaudetag/app/larktag/skills/xlsx/
+larkclaudetag/app/larktag/skills/pdf/
+larkclaudetag/app/larktag/skills/frontend-design/
+
+# Security scan exports
+ProbeScan/
+
+# Private deployment record (real account IDs / ARNs / VPC IDs) — kept locally,
+# never published. The public deploy guide (docs/DEPLOY_RUNBOOK.md) covers what
+# resources get created, with placeholders.
+RESOURCES.md
+
+# OS
+.DS_Store

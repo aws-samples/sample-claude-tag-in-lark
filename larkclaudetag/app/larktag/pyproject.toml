@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "larktag"
+version = "0.1.0"
+description = "Lark Claude Tag teammate — AgentCore Runtime app (Claude Agent SDK via LiteLLM)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aws-opentelemetry-distro",
+    "bedrock-agentcore >= 1.0.3",
+    "botocore[crt] >= 1.35.0",
+    "boto3 >= 1.35.0",
+    "requests >= 2.32.0",
+    # Agent engine
+    "claude-agent-sdk >= 0.2.0",
+    # AWS pricing MCP (stdio) — provides mcp__aws_pricing tools
+    "awslabs.aws-pricing-mcp-server >= 0.1.0",
+    # document-skills runtime deps (pptx/docx/xlsx/pdf in-container generation)
+    "python-pptx >= 1.0.2",
+    "python-docx >= 1.1.2",
+    "openpyxl >= 3.1.5",
+    "pypdf >= 5.1.0",
+    "matplotlib >= 3.9.0",
+    "pillow >= 10.4.0",      # pptx thumbnail.py (PIL) self-check rendering
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]

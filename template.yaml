@@ -1,0 +1,306 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Lark Claude Tag prototype — webhook Lambda (thin adapter to AgentCore Runtime)
+
+Parameters:
+  LarkSecretsArn:
+    Type: String
+    Description: Secrets Manager ARN holding LARK_APP_ID/LARK_APP_SECRET/LARK_ENCRYPT_KEY/LARK_VERIFICATION_TOKEN
+  AgentRuntimeArn:
+    Type: String
+    Description: ARN of the deployed AgentCore Runtime (from `agentcore` deploy)
+  LarkOpenBase:
+    Type: String
+    Default: https://open.larksuite.com
+    Description: Lark OpenAPI base (use https://open.feishu.cn for CN)
+  AgentCoreMemoryId:
+    Type: String
+    Description: AgentCore Memory id (same one the agent uses) — the ambient consolidator writes distilled facts into its per-channel facts namespace
+  MemorySemanticStrategyId:
+    Type: String
+    Default: ""
+    Description: SEMANTIC ("channel_facts") strategy id so consolidated facts land in the same recallable index the agent reads from
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 120
+    MemorySize: 512
+
+Resources:
+  LarkSharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: layers/lark-shared/
+      CompatibleRuntimes: [python3.12]
+    Metadata:
+      BuildMethod: python3.12
+
+  LarkWebhookFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      # Accepted findings — intentional for this thin public webhook adapter.
+      checkov:
+        skip:
+          - id: "CKV_AWS_117"
+            comment: "Intentionally NOT in a VPC: this thin adapter must reach Lark's public OpenAPI and invoke the AgentCore Runtime over the public AWS API. A VPC would add NAT for no security gain; the agent (which runs untrusted-ish work) is the VPC-isolated tier, not this adapter."
+          - id: "CKV_AWS_173"
+            comment: "Env vars hold only resource identifiers (ARNs) and a public base URL — no secrets. All secrets live in Secrets Manager and are fetched at runtime, so a CMK on env vars adds no protection."
+          - id: "CKV_AWS_116"
+            comment: "No DLQ by design: async self-invoke uses MaximumRetryAttempts=0 (avoids duplicate reply cards) and the sync path renders an in-band fallback reply on failure, so there is no silent message loss to capture."
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Public webhook adapter must reach Lark's public API + AgentCore over the public AWS API; VPC isolation is applied to the agent tier instead. See CKV_AWS_117."
+    Properties:
+      CodeUri: functions/lark-webhook/
+      Handler: handler.lambda_handler
+      Layers: [!Ref LarkSharedLayer]
+      # Same function serves the sync webhook (returns <1s) AND the self-invoked
+      # async processing path (runs the full agent turn, can take minutes for a
+      # skill/file task). 600s covers long turns so they don't get cut off.
+      Timeout: 600
+      # The async self-invoke must NOT auto-retry: a slow/long agent turn used to
+      # be retried 2x by the Lambda platform → the same @mention ran 3x → multiple
+      # duplicate reply cards. 0 retries = exactly one processing run per message.
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+      # Cap concurrency to bound cost / blast radius. Must cover BOTH the sync
+      # webhook invocations AND the async self-invoked agent turns (each @mention
+      # uses ~2). 50 is ample for a group-chat prototype; raise for higher traffic.
+      ReservedConcurrentExecutions: 50
+      Environment:
+        Variables:
+          LARK_SECRETS_ARN: !Ref LarkSecretsArn
+          AGENT_RUNTIME_ARN: !Ref AgentRuntimeArn
+          LARK_OPEN_BASE: !Ref LarkOpenBase
+          # Enroll a chat into the ambient-memory cursor table the first time the
+          # bot is used there, so the hourly consolidator knows to sweep it.
+          CONSOLIDATION_TABLE: !Ref ConsolidationTable
+      Policies:
+        - Statement:
+            - Sid: ReadLarkSecret
+              Effect: Allow
+              Action: [secretsmanager:GetSecretValue]
+              Resource: !Ref LarkSecretsArn
+            - Sid: InvokeAgentRuntime
+              Effect: Allow
+              Action: [bedrock-agentcore:InvokeAgentRuntime]
+              # the accessed resource is <runtime-arn>/runtime-endpoint/DEFAULT
+              Resource:
+                - !Ref AgentRuntimeArn
+                - !Sub "${AgentRuntimeArn}/*"
+            - Sid: SelfInvokeAsync
+              Effect: Allow
+              Action: [lambda:InvokeFunction]
+              Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-*"
+            - Sid: EnrollChatForConsolidation
+              Effect: Allow
+              Action: [dynamodb:UpdateItem]
+              Resource: !GetAtt ConsolidationTable.Arn
+      Events:
+        Webhook:
+          Type: HttpApi
+          Properties:
+            Path: /lark/webhook
+            Method: POST
+
+  # Registry of scheduled tasks / reminders. One row per job; the dispatcher
+  # scans it every minute. Name is fixed (not CFN-randomized) so the agent-side
+  # runtime secret (SCHEDULE_TABLE_NAME) and the runtime role's DDB inline policy
+  # can reference a stable name/ARN across the two deployment units.
+  SchedulesTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      checkov:
+        skip:
+          - id: "CKV_AWS_119"
+            comment: "Reminder/task metadata only (chat_id, prompt text, schedule) — no secrets/PII. DynamoDB's default AWS-owned encryption at rest is sufficient; a CMK adds cost without protecting anything sensitive."
+      cfn_nag:
+        rules_to_suppress:
+          - id: W74
+            reason: "Reminder/task metadata only (chat_id, prompt text, schedule) — no secrets/PII. DynamoDB's default AWS-owned encryption at rest is sufficient; a CMK adds cost without protecting anything sensitive. Same rationale as CKV_AWS_119 above."
+          - id: W28
+            reason: "TableName is intentionally fixed (not CFN-randomized) so the agent-side runtime secret SCHEDULE_TABLE_NAME and the runtime role's DDB inline-policy ARN can reference a stable name/ARN across the two deployment units (SAM + AgentCore CDK). A replacement would be a deliberate, coordinated change, not an incidental update."
+    Properties:
+      TableName: lark-claude-tag-schedules
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - { AttributeName: job_id, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+        - { AttributeName: next_run_epoch, AttributeType: N }
+        - { AttributeName: chat_id, AttributeType: S }
+        - { AttributeName: created_at, AttributeType: N }
+      KeySchema:
+        - { AttributeName: job_id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        # Dispatcher: query status=active AND next_run_epoch <= now (no full scan).
+        - IndexName: due-index
+          KeySchema:
+            - { AttributeName: status, KeyType: HASH }
+            - { AttributeName: next_run_epoch, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        # list_tasks / cancel_task: scope jobs to a chat, newest first.
+        - IndexName: chat-index
+          KeySchema:
+            - { AttributeName: chat_id, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  # Heartbeat dispatcher: fires every minute, claims due jobs, and asks the
+  # webhook function to deliver each (remind = post text; agent = run a turn).
+  # No layer needed — uses only boto3 (present in the Lambda runtime).
+  ScheduleDispatcherFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: "CKV_AWS_117"
+            comment: "Not in a VPC: only talks to DynamoDB and invokes the webhook Lambda over the public AWS API. Same rationale as the webhook adapter."
+          - id: "CKV_AWS_116"
+            comment: "No DLQ: the 1-minute tick is self-healing — a missed tick is retried on the next minute, and per-job claiming is idempotent, so there is nothing to capture in a DLQ."
+          - id: "CKV_AWS_173"
+            comment: "Env vars hold only resource identifiers (the schedules table name and the webhook function name) — no secrets. A CMK on env vars protects nothing here. Same rationale as the webhook adapter's CKV_AWS_173 skip."
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Dispatcher only reaches DynamoDB + AgentCore-bound webhook over the public AWS API; no VPC resources. See CKV_AWS_117."
+    Properties:
+      CodeUri: functions/dispatcher/
+      Handler: dispatcher.lambda_handler
+      Timeout: 120
+      ReservedConcurrentExecutions: 2
+      Environment:
+        Variables:
+          SCHEDULES_TABLE: !Ref SchedulesTable
+          WEBHOOK_FUNCTION_NAME: !Ref LarkWebhookFunction
+      Policies:
+        - Statement:
+            - Sid: ScanDueAndAdvanceJobs
+              Effect: Allow
+              Action: [dynamodb:Query, dynamodb:UpdateItem]
+              Resource:
+                - !GetAtt SchedulesTable.Arn
+                - !Sub "${SchedulesTable.Arn}/index/*"
+            - Sid: InvokeWebhookToDeliver
+              Effect: Allow
+              Action: [lambda:InvokeFunction]
+              Resource: !GetAtt LarkWebhookFunction.Arn
+      Events:
+        Tick:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Description: lark-claude-tag scheduled-task heartbeat
+
+  # Per-chat cursor for ambient-memory consolidation: chat_id -> last_ts_ms (the
+  # newest message create_time already swept). The webhook enrolls a chat here on
+  # first use; the consolidator advances the cursor each sweep. Fixed name so the
+  # webhook and consolidator reference it without extra wiring.
+  ConsolidationTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      checkov:
+        skip:
+          - id: "CKV_AWS_119"
+            comment: "Cursor metadata only (chat_id + last-swept timestamp) — no secrets/PII. Default AWS-owned encryption at rest is sufficient; a CMK adds cost without protecting anything sensitive."
+      cfn_nag:
+        rules_to_suppress:
+          - id: W74
+            reason: "Cursor metadata only (chat_id + timestamp) — no secrets/PII; default encryption suffices. Same rationale as CKV_AWS_119."
+          - id: W28
+            reason: "TableName is intentionally fixed so the webhook (enroll) and consolidator (sweep) reference a stable name across deploy units; a replacement would be a deliberate, coordinated change."
+    Properties:
+      TableName: lark-claude-tag-consolidation
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: chat_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: chat_id, KeyType: HASH }
+
+  # Ambient-memory consolidator: hourly, distills durable facts from non-@ group
+  # chatter into the same per-channel AgentCore Memory the agent recalls from.
+  # Uses the lark-shared layer (Lark tenant token + history pull). Not in a VPC —
+  # reaches Bedrock + AgentCore over the public API (no VPC-endpoint-policy change).
+  ConsolidatorFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: "CKV_AWS_117"
+            comment: "Not in a VPC: talks to Lark's public OpenAPI, Bedrock, AgentCore, and DynamoDB over the public AWS API. Same rationale as the webhook adapter; the VPC-isolated tier is the agent runtime."
+          - id: "CKV_AWS_116"
+            comment: "No DLQ: the hourly tick is self-healing — a missed run is retried next hour, the per-chat cursor only advances on success, and conservative extraction makes a re-sweep idempotent enough."
+          - id: "CKV_AWS_173"
+            comment: "Env vars hold only resource identifiers (table name, memory id, strategy id, secret ARN, base URL) — no secrets. A CMK on env vars protects nothing here."
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Reaches Lark + Bedrock + AgentCore + DynamoDB over the public AWS API; no VPC resources. See CKV_AWS_117."
+    Properties:
+      CodeUri: functions/consolidator/
+      Handler: consolidator.lambda_handler
+      Layers: [!Ref LarkSharedLayer]
+      # A sweep makes one Haiku call per chat that has new chatter; 300s covers
+      # several chats comfortably while staying well under any runaway.
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrentExecutions: 2
+      Environment:
+        Variables:
+          CONSOLIDATION_TABLE: !Ref ConsolidationTable
+          AGENTCORE_MEMORY_ID: !Ref AgentCoreMemoryId
+          MEMORY_SEMANTIC_STRATEGY_ID: !Ref MemorySemanticStrategyId
+          LARK_SECRETS_ARN: !Ref LarkSecretsArn
+          LARK_OPEN_BASE: !Ref LarkOpenBase
+      Policies:
+        - Statement:
+            - Sid: ReadLarkSecret
+              Effect: Allow
+              Action: [secretsmanager:GetSecretValue]
+              Resource: !Ref LarkSecretsArn
+            - Sid: CursorTable
+              Effect: Allow
+              Action: [dynamodb:Scan, dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt ConsolidationTable.Arn
+            - Sid: InvokeHaikuExtractor
+              Effect: Allow
+              Action: [bedrock:InvokeModel]
+              # Global cross-region inference profile + the foundation model it can
+              # route to (FM ARNs are account-less; region wildcard covers routing).
+              Resource:
+                - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/global.anthropic.claude-haiku-4-5-20251001-v1:0"
+                - "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
+            - Sid: WriteChannelMemory
+              Effect: Allow
+              Action: [bedrock-agentcore:BatchCreateMemoryRecords]
+              Resource:
+                - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/${AgentCoreMemoryId}"
+                - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/${AgentCoreMemoryId}/*"
+      Events:
+        Tick:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Description: lark-claude-tag ambient-memory consolidation sweep
+
+Outputs:
+  WebhookUrl:
+    Description: Configure this as the Lark event subscription URL
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/lark/webhook"
+  SchedulesTableName:
+    Description: Put this in the runtime secret as SCHEDULE_TABLE_NAME (agent-side schedule tools)
+    Value: !Ref SchedulesTable
+  SchedulesTableArn:
+    Description: Scope the runtime role's DDB inline policy to this ARN (+ /index/*)
+    Value: !GetAtt SchedulesTable.Arn
+  ConsolidationTableName:
+    Description: Per-chat ambient-memory cursor table (webhook enrolls, consolidator sweeps)
+    Value: !Ref ConsolidationTable

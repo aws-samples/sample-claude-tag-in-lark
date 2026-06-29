@@ -1,0 +1,15 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "lark-claude-tag"
+resolve_s3 = true
+s3_prefix = "lark-claude-tag"
+region = "us-west-2"
+capabilities = "CAPABILITY_IAM"
+# Fill these in before `sam deploy` (see docs/DEPLOY_RUNBOOK.md):
+#   LarkSecretsArn            — Secrets Manager ARN of the Lark bot credentials secret
+#   AgentRuntimeArn           — printed by `agentcore deploy` (the AgentCore Runtime ARN)
+#   LarkOpenBase              — https://open.larksuite.com (international) or https://open.feishu.cn (CN)
+#   AgentCoreMemoryId         — AgentCore Memory id (same as the runtime secret's AGENTCORE_MEMORY_ID)
+#   MemorySemanticStrategyId  — SEMANTIC strategy id (runtime secret's MEMORY_SEMANTIC_STRATEGY_ID)
+parameter_overrides = "LarkSecretsArn=<LARK_SECRETS_ARN> LarkOpenBase=https://open.larksuite.com AgentRuntimeArn=<AGENT_RUNTIME_ARN> AgentCoreMemoryId=<AGENTCORE_MEMORY_ID> MemorySemanticStrategyId=<MEMORY_SEMANTIC_STRATEGY_ID>"

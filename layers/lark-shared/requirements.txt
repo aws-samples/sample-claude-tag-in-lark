@@ -1,0 +1,10 @@
+# Lark shared layer deps (Lambda side).
+# Lower bounds exclude known CVEs (flagged by grype); pip resolves the latest patch.
+#   requests      >= 2.32.4 — CVE-2024-47081 (.netrc credential leak via crafted URL)
+#   cryptography  >= 46.0.5 — CVE-2026-26007 (SECT-curve subgroup attack); also ships a
+#                             non-vulnerable bundled OpenSSL (supersedes GHSA-79v4-65xg-pq4g)
+requests>=2.32.4
+cryptography>=46.0.5
+# boto3 must be new enough to know the 'bedrock-agentcore' data-plane client
+# (invoke_agent_runtime) — 1.35.x does NOT have it.
+boto3>=1.40.0

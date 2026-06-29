@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.agentcore.aws.dev/v1/agentcore.json",
+  "name": "larkclaudetag",
+  "version": 1,
+  "managedBy": "CDK",
+  "tags": {
+    "agentcore:created-by": "agentcore-cli",
+    "agentcore:project-name": "larkclaudetag"
+  },
+  "runtimes": [
+    {
+      "name": "larktag",
+      "build": "Container",
+      "entrypoint": "main.py",
+      "codeLocation": "app/larktag/",
+      "runtimeVersion": "PYTHON_3_14",
+      "networkMode": "VPC",
+      "networkConfig": {
+        "subnets": ["<PRIVATE_SUBNET_ID_1>", "<PRIVATE_SUBNET_ID_2>"],
+        "securityGroups": ["<SECURITY_GROUP_ID>"]
+      },
+      "protocol": "HTTP"
+    }
+  ],
+  "memories": [],
+  "credentials": [],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": [],
+  "policyEngines": [],
+  "harnesses": [],
+  "configBundles": [],
+  "abTests": [],
+  "httpGateways": []
+}

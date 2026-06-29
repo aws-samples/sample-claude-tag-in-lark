@@ -1,0 +1,8 @@
+[
+  {
+    "name": "default",
+    "description": "lark-claude-tag sample",
+    "account": "<AWS_ACCOUNT_ID>",
+    "region": "us-west-2"
+  }
+]
