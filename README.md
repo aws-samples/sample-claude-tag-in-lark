@@ -55,13 +55,15 @@ practices and standards.
 
 ![Architecture](docs/architecture.png)
 
-<sub>Reactive path (gray): @-mention → API Gateway → webhook Lambda →
-AgentCore Runtime → model/memory/skills/tools → SSE → CardKit reply.
+<sub>Reactive path (black, steps ①–⑤): @-mention → API Gateway → webhook Lambda →
+AgentCore Runtime → model (LiteLLM gateway → Bedrock) / memory / skills / Exa →
+SSE deltas → CardKit reply in-thread.
 Scheduling path (green): 1-minute EventBridge heartbeat → dispatcher → claim due
 jobs in DynamoDB → ask the webhook to deliver.
 Ambient path (blue): hourly EventBridge → consolidator → pull non-@ messages from
-Lark → distill durable facts into per-channel memory. Diagram source:
-`docs/architecture.py`.</sub>
+Lark → distill durable facts (Haiku, direct to Bedrock) into per-channel memory.
+Diagram source: `docs/architecture.drawio` (edit in [draw.io](https://www.drawio.com/),
+export to `architecture.png`).</sub>
 
 | Layer | Path |
 |-------|------|
