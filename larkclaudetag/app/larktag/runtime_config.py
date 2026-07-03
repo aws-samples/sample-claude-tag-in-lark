@@ -31,13 +31,14 @@ def _load() -> None:
 
         client = boto3.client("secretsmanager", region_name=os.environ.get("AWS_REGION", "us-west-2"))
         data = json.loads(client.get_secret_value(SecretId=secret_id)["SecretString"])
+        key_count = len(data)
         for k, v in data.items():
             os.environ.setdefault(k, str(v))
-        logger.info("Loaded %d runtime config keys from %s", len(data), secret_id)
+        # Log the key count only. The secret id (an ARN/name) and the values are
+        # deliberately kept out of the log so nothing sensitive is ever written.
+        logger.info("Loaded %d runtime config keys", key_count)
     except Exception:
-        # %s is secret_id (the Secrets Manager name/ARN — an identifier, not the
-        # value); the SecretString parsed above is never written to this log.
-        logger.exception("Failed to load runtime config (id=%s); continuing with env", secret_id)
+        logger.exception("Failed to load runtime config; continuing with existing env vars")
 
 
 _load()
