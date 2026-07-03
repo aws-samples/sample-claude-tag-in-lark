@@ -255,7 +255,14 @@ async def agent_invocation(payload, context):
     chat_id = payload.get("chat_id", "unknown")
     # Lark webhook sends {chat_id, text}; `agentcore invoke` sends {prompt}. Accept both.
     text = payload.get("text") or payload.get("prompt") or ""
-    session_id = payload.get("session_id", chat_id)
+    # Memory session rotates DAILY (Asia/Shanghai): an eternal per-channel session
+    # grows one immortal summary that recall keeps injecting and forget can never
+    # delete — a disputed fact in it haunted answers for days. Daily sessions keep
+    # summaries bounded and let stale ones age out of recall naturally. Payload may
+    # still pin a session_id explicitly (tests). Separator must be "-": AgentCore
+    # sessionId only allows [a-zA-Z0-9-_].
+    day = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y%m%d")
+    session_id = payload.get("session_id") or f"{chat_id}-{day}"
     images = payload.get("images") or []
     sender_open_id = payload.get("sender_open_id", "")
     logger.info("[req] chat_id=%s text_len=%d images=%d", chat_id, len(text), len(images))

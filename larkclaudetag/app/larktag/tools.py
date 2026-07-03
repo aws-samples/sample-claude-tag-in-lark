@@ -29,6 +29,12 @@ _current_chat_id = ""
 # fires, without the model handling an id it was never shown. "" if unknown.
 _current_user = ""
 
+# Per-chat cache of the last forget() candidate set: {chat_id: {record_id: text}}.
+# confirm_forget only accepts ids from here — the model cannot delete a record it
+# was never shown (guards against hallucinated/stale ids). Turns are serialized,
+# and the cache is refreshed on every forget() call.
+_forget_candidates: dict[str, dict[str, str]] = {}
+
 # Set when the agent saves/updates a skill mid-turn. main.py reads this to force a
 # warm-client rebuild on the NEXT turn so the `claude` CLI re-discovers skills
 # (skills are only scanned at CLI launch). Kept here (not in main) to avoid a
@@ -162,8 +168,9 @@ async def remember(args: dict) -> dict:
 
 @tool(
     "forget",
-    "当某条记住的信息过期、说错了或被推翻时,删除最匹配的那条记忆。"
-    "若是'X 改成了 Y'这类更新,先 forget(描述旧的 X) 再 remember(新的 Y)。参数 query 描述要忘掉的内容。",
+    "第一步·只查不删:按 query 语义搜出候选记忆(编号+原文+分数),不会删除任何东西。"
+    "拿到候选后核对原文,确认哪条真的是要忘的,再调 confirm_forget(record_id) 删那一条。"
+    "若是'X 改成了 Y'这类更新,先走 forget→confirm_forget 删旧的 X,再 remember(新的 Y)。",
     {"query": str},
 )
 async def forget(args: dict) -> dict:
@@ -172,8 +179,40 @@ async def forget(args: dict) -> dict:
         return _err("没说要忘掉什么。")
     if not _current_chat_id:
         return _err("当前没有群上下文。")
-    deleted = memory.forget_fact(_current_chat_id, query)
-    return _text(f"已经忘掉:{deleted}") if deleted else _text("没找到匹配的记忆,可能本来就没记。")
+    cands = memory.find_facts(_current_chat_id, query)
+    if not cands:
+        return _text("没找到匹配的记忆,可能本来就没记(或它不是一条可删的记忆)。什么都没有删。")
+    _forget_candidates[_current_chat_id] = {c["id"]: c["text"] for c in cands}
+    lines = ["找到以下候选记忆(尚未删除任何一条):"]
+    for i, c in enumerate(cands, 1):
+        src = "用户明确让记的" if c["layer"] == "explicit" else "自动记下的"
+        lines.append(f'{i}. [{src}, 匹配度{c["score"]:.2f}] record_id={c["id"]}\n   原文:{c["text"]}')
+    lines.append(
+        "核对原文:与要忘的内容一致才调 confirm_forget(record_id) 删除;"
+        "都对不上就直说没找到,绝不能删'最像的那条'。拿不准时把候选原文念给用户选。"
+    )
+    return _text("\n".join(lines))
+
+
+@tool(
+    "confirm_forget",
+    "第二步·真正删除:按 forget 返回的 record_id 精确删除那一条记忆。"
+    "只能传本轮 forget 候选里出现过的 record_id,且原文已确认无误。",
+    {"record_id": str},
+)
+async def confirm_forget(args: dict) -> dict:
+    rid = (args.get("record_id", "") or "").strip()
+    if not rid:
+        return _err("没给 record_id。先调 forget(query) 拿候选。")
+    if not _current_chat_id:
+        return _err("当前没有群上下文。")
+    known = _forget_candidates.get(_current_chat_id, {})
+    if rid not in known:
+        return _err("这个 record_id 不在最近一次 forget 的候选里。先调 forget(query) 重新拿候选,不要凭空拼 id。")
+    if not memory.delete_record(rid):
+        return _err("删除失败,稍后再试。")
+    text = known.pop(rid)
+    return _text(f"已经忘掉:{text}")
 
 
 # ---------------------------------------------------------------------------
@@ -262,8 +301,8 @@ async def cancel_task(args: dict) -> dict:
 # infeasible with a bot tenant token (wiki/doc search needs a user token; a bot has
 # no personal calendar). The function defs are kept for reference but unused.
 LARK_TOOLS = [
-    read_chat_history, create_lark_doc, deliver_file, remember, forget, save_skill,
-    schedule_task, list_tasks, cancel_task,
+    read_chat_history, create_lark_doc, deliver_file, remember, forget,
+    confirm_forget, save_skill, schedule_task, list_tasks, cancel_task,
 ]
 
 # Names as the model addresses them (mcp__<server>__<tool>)
@@ -273,6 +312,7 @@ LARK_ALLOWED = [
     "mcp__lark__deliver_file",
     "mcp__lark__remember",
     "mcp__lark__forget",
+    "mcp__lark__confirm_forget",
     "mcp__lark__save_skill",
     "mcp__lark__schedule_task",
     "mcp__lark__list_tasks",

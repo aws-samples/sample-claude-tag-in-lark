@@ -61,10 +61,15 @@ This creates the Memory with a SEMANTIC strategy (`channel_facts`) and a
 SUMMARIZATION strategy (`channel_summary`). Namespaces are templated on
 `{actorId}` = the Lark `chat_id`, so memory is isolated per channel.
 
-You need **two** values for the runtime config secret (Step 3):
+You need **two** values from this step:
 
-- **Memory ID** — printed by the script.
-- **Semantic strategy ID** — read it from the Memory after creation:
+- **Memory ID** — printed by the script; goes into the runtime config secret
+  (Step 3) and the SAM parameters (Step 8).
+- **Semantic strategy ID** — used only by the SAM stack (Step 8, the ambient
+  consolidator). The runtime itself no longer consumes it: explicit `remember`
+  facts are written strategy-free on purpose (see
+  [Operating the memory resource](#operating-the-memory-resource-migration--data-safety)).
+  Read it from the Memory after creation:
 
   ```bash
   aws bedrock-agentcore-control get-memory --memory-id <MEMORY_ID> \
@@ -106,7 +111,6 @@ Create a secret whose JSON value holds:
   "ANTHROPIC_API_KEY": "<your gateway API key>",
   "LITELLM_MODEL": "claude-opus-4-8",
   "AGENTCORE_MEMORY_ID": "<from Step 1>",
-  "MEMORY_SEMANTIC_STRATEGY_ID": "<from Step 1>",
   "SKILL_BUCKET": "<SKILL_BUCKET_NAME from Step 2>",
   "SCHEDULE_TABLE_NAME": "lark-claude-tag-schedules",
   "EXA_API_KEY": "<your Exa key>",
@@ -277,6 +281,53 @@ In the test group:
 3. **Tools/skills:** ask it to search the web (Exa), create a Lark doc, and
    generate a PPT/Word/Excel file → the file is delivered into the chat.
 4. **Multimodal:** @-mention with an image attached → it describes the image.
+
+---
+
+## Operating the memory resource (migration & data safety)
+
+The AgentCore Memory resource IS the bot's long-term brain. Two hard rules,
+both learned from a real incident (a same-night resource swap destroyed five
+days of channel memory and left a split-brain window that silently dropped turns):
+
+**1. Swapping the memory resource (e.g. moving to a CMK-encrypted one) is a data
+migration, not a config change.**
+
+```
+create new Memory → REPLAY data → verify → switch config atomically → keep old ≥ 7 days
+```
+
+- **Replay events** per actor/session: `ListEvents` on the old resource →
+  `CreateEvent` on the new one, preserving each original `eventTimestamp` (it is
+  client-supplied). This regenerates summaries and re-feeds extraction.
+- **Replay records** per namespace: `ListMemoryRecords` →
+  `BatchCreateMemoryRecords` (keep explicit-namespace records strategy-free —
+  see the layering table below).
+- **Verify** event/record counts per namespace match before switching traffic.
+- **Switch atomically**: the runtime secret (`AGENTCORE_MEMORY_ID`), the runtime
+  role's inline policy, and (VPC mode) the VPC endpoint policy must all move to
+  the new ARN together. A partial switch produces `AccessDeniedException` on
+  memory calls, and those turns are silently never persisted.
+- **Do not delete the old resource until the new one has served real traffic for
+  several days.** Deleting it minutes after cutover makes any migration gap
+  permanent.
+
+**2. Alarm on memory write failures.** All memory write/delete failures log at
+ERROR in the Runtime log group (`memory.record_turn failed`,
+`remember_fact failed`, `delete_record failed`). Add a CloudWatch metric filter
++ alarm — a failed `record_turn` means that turn never reached long-term memory
+and nothing else will tell you.
+
+**How memory is layered (why two fact namespaces):**
+
+| Namespace | Writer | Strategy-associated? |
+|-----------|--------|----------------------|
+| `/actor/{chat_id}/explicit` | `remember` tool (user-dictated facts) | **No** — semantically searchable, but immune to the service's background consolidation; removable only via the two-phase `forget` → `confirm_forget` flow (candidates first, then delete by confirmed record id) |
+| `/actor/{chat_id}/facts` | async extraction of turns + the ambient consolidator | Yes (SEMANTIC) — the service may merge or retire these in the background |
+
+Memory sessions rotate daily (`{chat_id}-YYYYMMDD`, set in `main.py`), so
+per-session summaries stay bounded and stale ones age out of recall instead of
+replaying superseded facts forever.
 
 ---
 

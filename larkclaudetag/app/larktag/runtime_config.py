@@ -9,8 +9,9 @@ at module load). Uses setdefault so any explicitly-set env var wins.
 
 Secret JSON is expected to hold:
   ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, LITELLM_MODEL, AGENTCORE_MEMORY_ID,
-  MEMORY_SEMANTIC_STRATEGY_ID, SKILL_BUCKET, SCHEDULE_TABLE_NAME, EXA_API_KEY,
+  SKILL_BUCKET, SCHEDULE_TABLE_NAME, EXA_API_KEY,
   AWS_KNOWLEDGE_MCP_URL, LARK_APP_ID, LARK_APP_SECRET, LARK_OPEN_BASE
+(extra keys such as a legacy MEMORY_SEMANTIC_STRATEGY_ID are exported but unused)
 """
 
 import json

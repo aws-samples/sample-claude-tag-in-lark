@@ -15,10 +15,16 @@ python create_memory.py     # from this directory, or: python infra/agentcore/cr
 
 | Strategy | Name | Namespace template | Purpose |
 |----------|------|--------------------|---------|
-| SEMANTIC | `channel_facts` | `/actor/{actorId}/facts` | durable, per-channel facts (semantic recall) |
-| SUMMARIZATION | `channel_summary` | `/actor/{actorId}/session/{sessionId}/summary` | rolling per-session summary |
+| SEMANTIC | `channel_facts` | `/actor/{actorId}/facts` | auto-extracted per-channel facts (semantic recall) |
+| SUMMARIZATION | `channel_summary` | `/actor/{actorId}/session/{sessionId}/summary` | rolling per-session summary (sessions rotate daily) |
 
-Both namespaces are templated on `{actorId}` = the Lark `chat_id`, which is what
+A third namespace, `/actor/{actorId}/explicit`, is used at runtime **without any
+strategy**: the `remember` tool writes user-dictated facts there. Strategy-free
+records are still semantically searchable, but the SEMANTIC strategy's background
+consolidation cannot merge or retire them — explicit facts only change when
+explicitly deleted.
+
+All namespaces are templated on `{actorId}` = the Lark `chat_id`, which is what
 **isolates memory per channel** — one channel can never recall another's facts.
 Raw short-term events are retained for 90 days (`eventExpiryDuration`).
 
@@ -28,29 +34,30 @@ the script for your environment.
 
 ## Wire it into the Runtime
 
-The script prints the **Memory ID**. The runtime config secret also needs the
-**semantic strategy ID** (so explicitly-written records land in the same
-retrievable index); read it from the created Memory:
+The script prints the **Memory ID** — put it into the runtime config secret as
+`AGENTCORE_MEMORY_ID` (Step 3 of the deploy guide). The **semantic strategy ID**
+is needed only by the SAM stack's ambient consolidator (Step 8 parameter
+`MemorySemanticStrategyId`); read it from the created Memory:
 
 ```bash
 aws bedrock-agentcore-control get-memory --memory-id <MEMORY_ID> --region <AWS_REGION> \
   --query "memory.strategies[?name=='channel_facts'].strategyId | [0]" --output text
 ```
 
-Put both into the runtime config secret as `AGENTCORE_MEMORY_ID` and
-`MEMORY_SEMANTIC_STRATEGY_ID` (Step 3 of the deploy guide).
-
 ## How the agent uses it
 
 `larkclaudetag/app/larktag/memory.py` integrates this Memory with the Claude Agent
 SDK manually (there is no turnkey session manager):
 
-- **Recall** before a turn — semantic search over `channel_facts` + the session
-  summary, merged.
+- **Recall** before a turn — semantic search layered explicit-first: `/explicit`
+  (user-dictated), then `/facts` (auto-extracted), then the current day's
+  session summary.
 - **Write** — `CreateEvent` after each turn feeds async long-term extraction;
-  `BatchCreateMemoryRecords` writes explicit "remember this" facts that are
-  immediately retrievable.
-- **Curate** — `DeleteMemoryRecord` supports explicit forget / supersede.
+  `BatchCreateMemoryRecords` writes explicit "remember this" facts to the
+  strategy-free `/explicit` namespace.
+- **Curate** — forgetting is two-phase: `find_facts` returns candidates
+  (text + record id + score), then `DeleteMemoryRecord` deletes exactly one
+  confirmed id. Never a blind delete of the top semantic match.
 
 > **VPC mode:** if the Runtime reaches the AgentCore data plane through a VPC
 > interface endpoint, the endpoint policy must allow the `bedrock-agentcore`

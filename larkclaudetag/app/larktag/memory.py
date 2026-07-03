@@ -22,8 +22,26 @@ extraction:
     - record_turn(): unchanged passive path — persist the raw turn as an event so
       AgentCore's async extraction keeps building long-term memory in the background.
 
-  Curate (forgetting / superseding):
-    - forget_fact(): find the best-matching fact and DeleteMemoryRecord it.
+  Curate (forgetting / superseding) — TWO-PHASE, never blind-delete:
+    - find_facts(): semantic search returning candidates (id + text + score),
+      explicit layer first. Phase 1 of forgetting: the agent (and the user) see
+      exactly what would be deleted before anything is deleted.
+    - delete_record(): delete ONE record by its exact id. Phase 2.
+    (An earlier design deleted the top-1 semantic match directly; with a memory
+    pool polluted by many similar records, that repeatedly deleted innocent
+    neighbors — e.g. a query containing "CMK" landing on KMS troubleshooting
+    memories. Deletion is now only ever by confirmed record id.)
+
+  LAYERING — explicit facts live in their own namespace, deliberately NOT
+  associated with any strategy:
+    - Explicit "the user told me to remember this" facts go to /actor/{id}/explicit.
+      Records without a strategy association are still semantically searchable
+      (verified) but sit OUTSIDE the SEMANTIC strategy's consolidation domain, so
+      the service's background consolidation cannot silently rewrite or retire
+      them — only an explicit delete_record() can. (Strategy-extracted records in
+      /facts HAVE been observed to be merged/retired by consolidation.)
+    - Auto-extracted facts (async extraction of turns, ambient 旁听) stay in
+      /actor/{id}/facts; they are lower-trust background knowledge.
 
 Everything is wrapped defensively: any API mismatch degrades that operation to a
 no-op (logged) rather than crashing the agent turn.
@@ -41,16 +59,17 @@ logger = logging.getLogger(__name__)
 MEMORY_ID = os.environ.get("AGENTCORE_MEMORY_ID", "")
 REGION = os.environ.get("AWS_REGION", "us-west-2")
 
-# Namespace templates — must match what create_memory.py configured on each strategy.
+# Namespace templates — FACTS/SUMMARY must match what create_memory.py configured
+# on each strategy. EXPLICIT is strategy-free by design (see module docstring).
 FACTS_NS_TMPL = os.environ.get("MEMORY_NAMESPACE_TMPL", "/actor/{actorId}/facts")
+EXPLICIT_NS_TMPL = os.environ.get("MEMORY_EXPLICIT_NS_TMPL", "/actor/{actorId}/explicit")
 SUMMARY_NS_TMPL = os.environ.get(
     "MEMORY_SUMMARY_NS_TMPL", "/actor/{actorId}/session/{sessionId}/summary"
 )
-# Strategy id of the SEMANTIC ("channel_facts") strategy. Required so a directly
-# written record lands in the same retrievable index. Read from GetMemory at deploy
-# and injected via the runtime secret. If empty, remember_fact still writes but the
-# record may not associate with the semantic index (ListMemoryRecords still finds it).
-SEMANTIC_STRATEGY_ID = os.environ.get("MEMORY_SEMANTIC_STRATEGY_ID", "")
+# NOTE: explicit records are deliberately written WITHOUT a memoryStrategyId
+# (MEMORY_SEMANTIC_STRATEGY_ID is no longer consumed here) — strategy-free
+# records are still semantically searchable but immune to the strategy's
+# background consolidation. See module docstring.
 
 # Optional escape hatch: also scan recent records in the facts namespace and merge
 # them into recall. Default OFF — testing showed a directly-written record takes
@@ -92,9 +111,9 @@ def _rec_id(rec: dict) -> str:
 def retrieve(actor_id: str, query: str, session_id: str | None = None, top_k: int = 5) -> list[str]:
     """Return relevant long-term memory snippets for this channel, or [].
 
-    Searches the facts namespace and (if session_id given) the session-summary
-    namespace, then merges with a recent-records fallback. De-duplicated by text,
-    capped at top_k+2.
+    Layered: explicit facts (user-dictated, highest trust) first, then
+    auto-extracted facts, then (if session_id given) the session summary.
+    De-duplicated by text, capped at top_k+2.
     """
     if not MEMORY_ID or not query:
         return []
@@ -107,7 +126,20 @@ def retrieve(actor_id: str, query: str, session_id: str | None = None, top_k: in
             seen.add(t)
             out.append(t)
 
-    # 1) Semantic search over facts.
+    # 1) Explicit facts first — what the user dictated outranks what was inferred.
+    explicit_ns = EXPLICIT_NS_TMPL.format(actorId=actor_id)
+    try:
+        resp = _c().retrieve_memory_records(
+            memoryId=MEMORY_ID,
+            namespace=explicit_ns,
+            searchCriteria={"searchQuery": query, "topK": top_k},
+        )
+        for rec in resp.get("memoryRecordSummaries", []) or []:
+            _add(_rec_text(rec))
+    except Exception:
+        logger.warning("retrieve(explicit) failed", exc_info=True)
+
+    # 2) Auto-extracted facts (async extraction + ambient 旁听) — background layer.
     facts_ns = FACTS_NS_TMPL.format(actorId=actor_id)
     try:
         resp = _c().retrieve_memory_records(
@@ -120,7 +152,11 @@ def retrieve(actor_id: str, query: str, session_id: str | None = None, top_k: in
     except Exception:
         logger.warning("retrieve(facts) failed", exc_info=True)
 
-    # 2) Semantic search over the session summary (if we know the session).
+    # 3) Semantic search over the session summary (if we know the session).
+    # session_id rotates daily (main.py), so this only surfaces the CURRENT
+    # day's summary — stale summaries age out of recall instead of replaying
+    # superseded facts forever (an eternal per-channel session once kept
+    # re-serving a retired project code name from day one).
     if session_id:
         summary_ns = SUMMARY_NS_TMPL.format(actorId=actor_id, sessionId=session_id)
         try:
@@ -201,27 +237,29 @@ def recent_events(actor_id: str, session_id: str, n: int = 6) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def remember_fact(actor_id: str, text: str) -> bool:
-    """Directly persist a fact that is IMMEDIATELY retrievable (no async wait).
+    """Directly persist an explicit fact. Used by the `remember` tool.
 
-    Used by the `remember` tool. Returns True on success.
+    Writes to the EXPLICIT namespace with NO strategy association: still
+    semantically searchable (indexing takes ~20-60s; the immediacy gap is
+    covered by recent_events() re-seeding), but outside the SEMANTIC strategy's
+    consolidation domain — the service's background consolidation cannot
+    silently rewrite or retire a fact the user dictated. Returns True on success.
     """
     text = (text or "").strip()
     if not MEMORY_ID or not text:
         return False
-    facts_ns = FACTS_NS_TMPL.format(actorId=actor_id)
+    explicit_ns = EXPLICIT_NS_TMPL.format(actorId=actor_id)
     record = {
         "requestIdentifier": f"{actor_id}-{uuid.uuid4().hex}",
-        "namespaces": [facts_ns],
+        "namespaces": [explicit_ns],
         "content": {"text": text},
         "timestamp": int(time.time()),
     }
-    if SEMANTIC_STRATEGY_ID:
-        record["memoryStrategyId"] = SEMANTIC_STRATEGY_ID
     try:
         _c().batch_create_memory_records(memoryId=MEMORY_ID, records=[record])
         return True
     except Exception:
-        logger.warning("remember_fact failed", exc_info=True)
+        logger.error("remember_fact failed", exc_info=True)
         return False
 
 
@@ -245,34 +283,61 @@ def record_turn(actor_id: str, session_id: str, user_text: str, assistant_text: 
             payload=turns,
         )
     except Exception:
-        logger.warning("memory.record_turn failed (turn not persisted)", exc_info=True)
+        # ERROR, not WARNING: a failed record_turn means the turn silently never
+        # reaches long-term memory (this exact failure mode lost turns during a
+        # memory-resource migration). Alarm on this in CloudWatch.
+        logger.error("memory.record_turn failed (turn not persisted)", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
 # Curate (forget / supersede)
 # ---------------------------------------------------------------------------
 
-def forget_fact(actor_id: str, query: str) -> str:
-    """Find the fact best matching `query` and delete it. Returns the deleted
-    text (so the caller can confirm), or "" if nothing matched / on failure."""
+# Candidates scoring below this are noise, not matches — semantic search always
+# returns SOMETHING (nearest neighbor), which is exactly how a code-name query
+# once deleted two unrelated KMS memories. Deletion additionally requires an
+# exact record id (see delete_record), so this floor only trims the候选 list.
+MIN_FORGET_SCORE = 0.35
+
+
+def find_facts(actor_id: str, query: str, top_k: int = 3) -> list[dict]:
+    """Phase 1 of forgetting: return candidate facts matching `query`, WITHOUT
+    deleting anything. Each candidate: {"id", "text", "score", "layer"} where
+    layer is "explicit" (user-dictated) or "auto" (extracted/ambient). Explicit
+    candidates come first — what the user wants forgotten is almost always
+    something they dictated."""
     if not MEMORY_ID or not query:
-        return ""
-    facts_ns = FACTS_NS_TMPL.format(actorId=actor_id)
+        return []
+    out: list[dict] = []
+    layers = [
+        ("explicit", EXPLICIT_NS_TMPL.format(actorId=actor_id)),
+        ("auto", FACTS_NS_TMPL.format(actorId=actor_id)),
+    ]
+    for layer, ns in layers:
+        try:
+            resp = _c().retrieve_memory_records(
+                memoryId=MEMORY_ID,
+                namespace=ns,
+                searchCriteria={"searchQuery": query, "topK": top_k},
+            )
+            for rec in resp.get("memoryRecordSummaries", []) or []:
+                rid, text = _rec_id(rec), _rec_text(rec)
+                score = float(rec.get("score") or 0)
+                if rid and text and score >= MIN_FORGET_SCORE:
+                    out.append({"id": rid, "text": text, "score": score, "layer": layer})
+        except Exception:
+            logger.warning("find_facts(%s) failed", layer, exc_info=True)
+    return out[: top_k * 2]
+
+
+def delete_record(record_id: str) -> bool:
+    """Phase 2 of forgetting: delete ONE record by its exact id (which must come
+    from a find_facts() candidate the agent/user just confirmed)."""
+    if not MEMORY_ID or not record_id:
+        return False
     try:
-        resp = _c().retrieve_memory_records(
-            memoryId=MEMORY_ID,
-            namespace=facts_ns,
-            searchCriteria={"searchQuery": query, "topK": 1},
-        )
-        recs = resp.get("memoryRecordSummaries", []) or []
-        if not recs:
-            return ""
-        rid = _rec_id(recs[0])
-        text = _rec_text(recs[0])
-        if not rid:
-            return ""
-        _c().delete_memory_record(memoryId=MEMORY_ID, memoryRecordId=rid)
-        return text or "(已删除)"
+        _c().delete_memory_record(memoryId=MEMORY_ID, memoryRecordId=record_id)
+        return True
     except Exception:
-        logger.warning("forget_fact failed", exc_info=True)
-        return ""
+        logger.error("delete_record failed", exc_info=True)
+        return False

@@ -26,10 +26,12 @@ practices and standards.
    tools/skills, and streams the reply into the thread (live CardKit updates that
    show which tool is running).
 2. **Self-evolving memory (per channel)** — actively curates its own long-term
-   memory: `remember` writes durable facts, `forget` supersedes stale ones,
-   recall merges semantic facts + session summary, and a fresh container is
-   re-seeded from recent raw turns. Memory is **isolated per channel** (no
-   cross-channel leakage).
+   memory: `remember` writes durable facts into an explicit, consolidation-immune
+   layer; forgetting is two-phase (`forget` lists matching candidates,
+   `confirm_forget` deletes one confirmed record id — never a blind best-match
+   delete); recall merges explicit facts, auto-extracted facts and the current
+   day's session summary, and a fresh container is re-seeded from recent raw
+   turns. Memory is **isolated per channel** (no cross-channel leakage).
 3. **Self-evolving skills (global)** — after finishing a reusable multi-step task
    the agent can distill it into a Claude Code skill via `save_skill`, stored in
    S3 and **shared across all channels**; skills sync into the container at
@@ -102,7 +104,7 @@ against the LiteLLM gateway.
 | **LiteLLM** ALB URL + key + model **alias** | Runtime config secret `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` / `LITELLM_MODEL` |
 | **Lark self-built app**: app_id/secret/encrypt_key/verification_token; scopes `im:message`, `im:message:send_as_bot`, `im:resource`, `cardkit:card:read/write`, `docx:document`; subscribe `im.message.receive_v1` | Secrets Manager + Runtime config |
 | **Exa API key** | Runtime config secret `EXA_API_KEY` |
-| **AWS account/region** + AgentCore Memory id + semantic strategy id | `create_memory.py` → `AGENTCORE_MEMORY_ID` / `MEMORY_SEMANTIC_STRATEGY_ID` |
+| **AWS account/region** + AgentCore Memory id (+ semantic strategy id, for the SAM consolidator parameter only) | `create_memory.py` → Runtime config secret `AGENTCORE_MEMORY_ID`; strategy id → SAM `MemorySemanticStrategyId` |
 | **S3 bucket** for learned skills (private, versioned) | Runtime config secret `SKILL_BUCKET` |
 | **DynamoDB schedules table** name (SAM creates it as `lark-claude-tag-schedules`) | Runtime config secret `SCHEDULE_TABLE_NAME` |
 

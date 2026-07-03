@@ -63,5 +63,19 @@ The table maps Claude Tag's described capabilities to what this sample implement
   manager like Strands provides): `RetrieveMemoryRecords` before the turn,
   `CreateEvent` after it (feeding async long-term extraction), and direct
   `BatchCreateMemoryRecords` for explicit "remember this now" facts.
+- **Strategy-managed records are not stable storage.** Records in a SEMANTIC
+  strategy's namespace can be merged or retired by the service's background
+  consolidation at any time (observed: an explicitly written fact disappeared
+  after a contradicting conversation, without any client-side delete). Hence
+  the memory is layered: user-dictated facts go to a **strategy-free**
+  `/actor/{id}/explicit` namespace — still semantically searchable, but only
+  removable by an explicit two-phase delete (`forget` returns candidates with
+  record ids, `confirm_forget` deletes exactly one confirmed id; never a blind
+  top-1 semantic delete). Auto-extracted facts stay in the strategy-managed
+  `/facts` namespace as a lower-trust background layer.
+- **Memory sessions rotate daily** (`{chat_id}-YYYYMMDD`). An eternal
+  per-channel session accumulates one immortal summary that recall keeps
+  injecting and no tool can delete; daily rotation bounds summaries and lets
+  superseded ones age out of recall.
 - **Lark international vs CN:** OpenAPI base is `https://open.larksuite.com`
   (international) or `https://open.feishu.cn` (CN), configurable via `LARK_OPEN_BASE`.
