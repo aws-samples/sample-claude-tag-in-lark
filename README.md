@@ -29,9 +29,13 @@ practices and standards.
    memory: `remember` writes durable facts into an explicit, consolidation-immune
    layer; forgetting is two-phase (`forget` lists matching candidates,
    `confirm_forget` deletes one confirmed record id — never a blind best-match
-   delete); recall merges explicit facts, auto-extracted facts and the current
-   day's session summary, and a fresh container is re-seeded from recent raw
-   turns. Memory is **isolated per channel** (no cross-channel leakage).
+   delete); `list_memories` shows the full inventory ("what do you remember?");
+   recall merges explicit facts, auto-extracted facts and the current day's
+   session summary with fuzzy de-duplication and recency weighting, and a fresh
+   container is re-seeded from recent raw turns. A **weekly gardener** prunes the
+   auto layer (duplicates, memory-ops echo, resolved-troubleshooting residue)
+   under conservative guardrails. Memory is **isolated per channel** (no
+   cross-channel leakage).
 3. **Self-evolving skills (global)** — after finishing a reusable multi-step task
    the agent can distill it into a Claude Code skill via `save_skill`, stored in
    S3 and **shared across all channels**; skills sync into the container at

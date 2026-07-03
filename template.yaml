@@ -291,6 +291,64 @@ Resources:
             Schedule: rate(1 hour)
             Description: lark-claude-tag ambient-memory consolidation sweep
 
+  # Weekly memory gardener: conservative hygiene pass over the AUTO memory layer
+  # (dedup vs explicit facts, memory-ops echo records, resolved-troubleshooting
+  # residue). Never touches the explicit layer; hard caps + min-age guardrails;
+  # supports {"dry_run": true} invocations. Not in a VPC (public AWS APIs only).
+  GardenerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: "CKV_AWS_117"
+            comment: "Not in a VPC: talks to Bedrock, AgentCore, and DynamoDB over the public AWS API. Same rationale as the consolidator; the VPC-isolated tier is the agent runtime."
+          - id: "CKV_AWS_116"
+            comment: "No DLQ: the weekly pass is self-healing — a missed run is simply covered by the next one; every action is independent and idempotent (delete of an already-deleted record is a no-op failure that is logged and skipped)."
+          - id: "CKV_AWS_173"
+            comment: "Env vars hold only resource identifiers (table name, memory id, model id) — no secrets."
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Reaches Bedrock + AgentCore + DynamoDB over the public AWS API; no VPC resources. See CKV_AWS_117."
+    Properties:
+      CodeUri: functions/gardener/
+      Handler: gardener.lambda_handler
+      # One Haiku call per enrolled chat with >=2 eligible records; 300s covers
+      # many chats comfortably.
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          CONSOLIDATION_TABLE: !Ref ConsolidationTable
+          AGENTCORE_MEMORY_ID: !Ref AgentCoreMemoryId
+      Policies:
+        - Statement:
+            - Sid: EnumerateChats
+              Effect: Allow
+              Action: [dynamodb:Scan]
+              Resource: !GetAtt ConsolidationTable.Arn
+            - Sid: InvokeHaikuGardener
+              Effect: Allow
+              Action: [bedrock:InvokeModel]
+              Resource:
+                - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/global.anthropic.claude-haiku-4-5-20251001-v1:0"
+                - "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
+            - Sid: GardenChannelMemory
+              Effect: Allow
+              Action:
+                - bedrock-agentcore:ListMemoryRecords
+                - bedrock-agentcore:DeleteMemoryRecord
+              Resource:
+                - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/${AgentCoreMemoryId}"
+                - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/${AgentCoreMemoryId}/*"
+      Events:
+        Tick:
+          Type: Schedule
+          Properties:
+            Schedule: rate(7 days)
+            Description: lark-claude-tag weekly memory-gardening pass
+
 Outputs:
   WebhookUrl:
     Description: Configure this as the Lark event subscription URL

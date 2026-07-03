@@ -47,8 +47,10 @@ Everything is wrapped defensively: any API mismatch degrades that operation to a
 no-op (logged) rather than crashing the agent turn.
 """
 
+import difflib
 import logging
 import os
+import re
 import time
 import uuid
 
@@ -104,6 +106,40 @@ def _rec_id(rec: dict) -> str:
     return rec.get("memoryRecordId") or rec.get("id") or ""
 
 
+def _rec_epoch(rec: dict) -> float:
+    """createdAt as epoch seconds (0 if absent) — boto3 returns a datetime."""
+    ts = rec.get("createdAt") or rec.get("timestamp")
+    try:
+        return ts.timestamp()
+    except AttributeError:
+        try:
+            return float(ts or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+
+# Source-tag prefixes ("[群聊旁听] ", "[个人动态] "…) are provenance, not content —
+# strip them before comparing, or the same fact tagged two ways never dedupes.
+_TAG_RE = re.compile(r"^\[[^\]]{1,12}\]\s*")
+_NOISE_RE = re.compile(r"[\s,,.。、;;::!!??*~·'\"“”‘’()()]+")
+
+
+def _norm_text(t: str) -> str:
+    return _NOISE_RE.sub("", _TAG_RE.sub("", (t or "").strip())).lower()
+
+
+def _is_dup(a: str, b: str) -> bool:
+    """Fuzzy same-fact check: containment or high sequence similarity after
+    normalization. The explicit tool and async extraction routinely double-write
+    the same fact with slightly different wording."""
+    na, nb = _norm_text(a), _norm_text(b)
+    if not na or not nb:
+        return False
+    if na in nb or nb in na:
+        return True
+    return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.85
+
+
 # ---------------------------------------------------------------------------
 # Recall
 # ---------------------------------------------------------------------------
@@ -112,72 +148,60 @@ def retrieve(actor_id: str, query: str, session_id: str | None = None, top_k: in
     """Return relevant long-term memory snippets for this channel, or [].
 
     Layered: explicit facts (user-dictated, highest trust) first, then
-    auto-extracted facts, then (if session_id given) the session summary.
-    De-duplicated by text, capped at top_k+2.
+    auto-extracted facts, then (if session_id given) the CURRENT day's session
+    summary (session_id rotates daily in main.py, so stale summaries age out of
+    recall instead of replaying superseded facts forever).
+
+    Within a layer, candidates are ordered by semantic-score bucket (0.1 wide)
+    with newer records winning inside a bucket — a stale fact must out-SCORE a
+    fresh one to outrank it, near-ties go to recency. Merged with fuzzy
+    de-duplication (higher-trust copy wins), capped at top_k+2.
     """
     if not MEMORY_ID or not query:
         return []
-    seen: set[str] = set()
-    out: list[str] = []
 
-    def _add(text: str):
-        t = (text or "").strip()
-        if t and t not in seen:
-            seen.add(t)
-            out.append(t)
+    cands: list[dict] = []
 
-    # 1) Explicit facts first — what the user dictated outranks what was inferred.
-    explicit_ns = EXPLICIT_NS_TMPL.format(actorId=actor_id)
-    try:
-        resp = _c().retrieve_memory_records(
-            memoryId=MEMORY_ID,
-            namespace=explicit_ns,
-            searchCriteria={"searchQuery": query, "topK": top_k},
-        )
-        for rec in resp.get("memoryRecordSummaries", []) or []:
-            _add(_rec_text(rec))
-    except Exception:
-        logger.warning("retrieve(explicit) failed", exc_info=True)
-
-    # 2) Auto-extracted facts (async extraction + ambient 旁听) — background layer.
-    facts_ns = FACTS_NS_TMPL.format(actorId=actor_id)
-    try:
-        resp = _c().retrieve_memory_records(
-            memoryId=MEMORY_ID,
-            namespace=facts_ns,
-            searchCriteria={"searchQuery": query, "topK": top_k},
-        )
-        for rec in resp.get("memoryRecordSummaries", []) or []:
-            _add(_rec_text(rec))
-    except Exception:
-        logger.warning("retrieve(facts) failed", exc_info=True)
-
-    # 3) Semantic search over the session summary (if we know the session).
-    # session_id rotates daily (main.py), so this only surfaces the CURRENT
-    # day's summary — stale summaries age out of recall instead of replaying
-    # superseded facts forever (an eternal per-channel session once kept
-    # re-serving a retired project code name from day one).
-    if session_id:
-        summary_ns = SUMMARY_NS_TMPL.format(actorId=actor_id, sessionId=session_id)
+    def _search(namespace: str, layer: int, k: int, label: str):
         try:
             resp = _c().retrieve_memory_records(
                 memoryId=MEMORY_ID,
-                namespace=summary_ns,
-                searchCriteria={"searchQuery": query, "topK": 2},
+                namespace=namespace,
+                searchCriteria={"searchQuery": query, "topK": k},
             )
             for rec in resp.get("memoryRecordSummaries", []) or []:
-                _add(_rec_text(rec))
+                text = _rec_text(rec).strip()
+                if text:
+                    cands.append({
+                        "text": text,
+                        "layer": layer,
+                        "score": float(rec.get("score") or 0),
+                        "epoch": _rec_epoch(rec),
+                    })
         except Exception:
-            logger.warning("retrieve(summary) failed", exc_info=True)
+            logger.warning("retrieve(%s) failed", label, exc_info=True)
 
-    # 3) Fallback: most-recent explicit facts (in case the semantic index lags).
+    _search(EXPLICIT_NS_TMPL.format(actorId=actor_id), 0, top_k, "explicit")
+    _search(FACTS_NS_TMPL.format(actorId=actor_id), 1, top_k, "facts")
+    if session_id:
+        _search(SUMMARY_NS_TMPL.format(actorId=actor_id, sessionId=session_id), 2, 2, "summary")
+
+    # Optional escape hatch: recent explicit facts in case the semantic index lags.
     if LIST_FALLBACK:
         for rec in _list_recent_facts(actor_id, limit=10):
-            _add(_rec_text(rec))
-            if len(out) >= top_k + 2:
-                break
+            text = _rec_text(rec).strip()
+            if text:
+                cands.append({"text": text, "layer": 1, "score": 0.0, "epoch": _rec_epoch(rec)})
 
-    return out[: top_k + 2]
+    cands.sort(key=lambda c: (c["layer"], -round(c["score"] * 10), -c["epoch"]))
+    out: list[str] = []
+    for c in cands:
+        if any(_is_dup(c["text"], kept) for kept in out):
+            continue
+        out.append(c["text"])
+        if len(out) >= top_k + 2:
+            break
+    return out
 
 
 def _list_recent_facts(actor_id: str, limit: int = 10) -> list[dict]:
@@ -199,6 +223,37 @@ def _list_recent_facts(actor_id: str, limit: int = 10) -> list[dict]:
     except Exception:
         logger.warning("list_memory_records fallback failed", exc_info=True)
         return []
+
+
+def list_facts(actor_id: str, explicit_limit: int = 50, auto_limit: int = 20) -> dict:
+    """Full memory inventory for the transparency tool ("what do you remember?"):
+    ALL explicit facts plus the most recent auto-extracted ones, newest first.
+    Semantic search can only ever show what matches a query; this shows everything.
+    Returns {"explicit": [{"id","text","epoch"}...], "auto": [...]}, best-effort."""
+
+    def _list(namespace: str, limit: int) -> list[dict]:
+        try:
+            resp = _c().list_memory_records(
+                memoryId=MEMORY_ID, namespace=namespace, maxResults=min(limit, 100)
+            )
+            recs = resp.get("memoryRecordSummaries") or resp.get("memoryRecords") or []
+            items = [
+                {"id": _rec_id(r), "text": _rec_text(r).strip(), "epoch": _rec_epoch(r)}
+                for r in recs
+                if _rec_text(r).strip()
+            ]
+            items.sort(key=lambda x: -x["epoch"])
+            return items[:limit]
+        except Exception:
+            logger.warning("list_facts(%s) failed", namespace, exc_info=True)
+            return []
+
+    if not MEMORY_ID:
+        return {"explicit": [], "auto": []}
+    return {
+        "explicit": _list(EXPLICIT_NS_TMPL.format(actorId=actor_id), explicit_limit),
+        "auto": _list(FACTS_NS_TMPL.format(actorId=actor_id), auto_limit),
+    }
 
 
 def recent_events(actor_id: str, session_id: str, n: int = 6) -> list[str]:

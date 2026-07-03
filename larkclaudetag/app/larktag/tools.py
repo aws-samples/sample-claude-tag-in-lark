@@ -9,6 +9,7 @@ Tool name as seen by the model: mcp__lark__<name>  (see allowed_tools in main.py
 import json
 import logging
 import os
+import time
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
@@ -195,6 +196,32 @@ async def forget(args: dict) -> dict:
 
 
 @tool(
+    "list_memories",
+    "列出这个群的长期记忆全量清单:用户明确让记的全部 + 自动记下(旁听/对话蒸馏)的最近若干条。"
+    "用户问「你都记着什么/记了我什么/记忆里有啥」时用;删记忆前想看全貌也可以用。",
+    {},
+)
+async def list_memories(args: dict) -> dict:
+    if not _current_chat_id:
+        return _err("当前没有群上下文。")
+    inv = memory.list_facts(_current_chat_id)
+    exp, auto = inv["explicit"], inv["auto"]
+    lines: list[str] = []
+    if exp:
+        lines.append(f"用户明确让记的({len(exp)} 条,永久,只有用户能删):")
+        for i, r in enumerate(exp, 1):
+            lines.append(f"{i}. {r['text']}")
+    else:
+        lines.append("用户明确让记的:还没有。")
+    if auto:
+        lines.append(f"自动记下的最近 {len(auto)} 条(旁听/对话蒸馏,背景参考):")
+        for r in auto:
+            day = time.strftime("%m-%d", time.localtime(r["epoch"])) if r["epoch"] else "?"
+            lines.append(f"- [{day}] {r['text']}")
+    return _text("\n".join(lines))
+
+
+@tool(
     "confirm_forget",
     "第二步·真正删除:按 forget 返回的 record_id 精确删除那一条记忆。"
     "只能传本轮 forget 候选里出现过的 record_id,且原文已确认无误。",
@@ -302,7 +329,8 @@ async def cancel_task(args: dict) -> dict:
 # no personal calendar). The function defs are kept for reference but unused.
 LARK_TOOLS = [
     read_chat_history, create_lark_doc, deliver_file, remember, forget,
-    confirm_forget, save_skill, schedule_task, list_tasks, cancel_task,
+    confirm_forget, list_memories, save_skill, schedule_task, list_tasks,
+    cancel_task,
 ]
 
 # Names as the model addresses them (mcp__<server>__<tool>)
@@ -313,6 +341,7 @@ LARK_ALLOWED = [
     "mcp__lark__remember",
     "mcp__lark__forget",
     "mcp__lark__confirm_forget",
+    "mcp__lark__list_memories",
     "mcp__lark__save_skill",
     "mcp__lark__schedule_task",
     "mcp__lark__list_tasks",

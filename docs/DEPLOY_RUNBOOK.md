@@ -329,6 +329,25 @@ Memory sessions rotate daily (`{chat_id}-YYYYMMDD`, set in `main.py`), so
 per-session summaries stay bounded and stale ones age out of recall instead of
 replaying superseded facts forever.
 
+**Weekly gardening.** The SAM stack ships a `GardenerFunction` (`rate(7 days)`)
+that reviews each chat's auto layer with a conservative model pass and deletes
+only three kinds of weeds: duplicates (including auto copies of protected
+explicit facts), memory-ops echo records, and resolved-troubleshooting residue.
+Guardrails: the explicit layer is never modified, records younger than
+`MIN_AGE_DAYS` (default 7) are untouchable, at most `MAX_DELETES_PER_CHAT`
+(default 10) deletions per chat per run, and every action is logged with its
+reason. Manual invocations accept `{"dry_run": true}` (report without applying),
+`{"actors": [...]}` (narrow the sweep) and `{"min_age_days": N}`.
+
+> **CMK-encrypted Memory:** if the Memory resource uses a customer-managed KMS
+> key, every role that reads or writes it must be allowed on the key. The
+> pattern used here is a key-policy statement allow-listing the runtime,
+> consolidator **and gardener** roles with
+> `kms:Decrypt/GenerateDataKey/DescribeKey/CreateGrant/ReEncrypt*` under
+> `kms:ViaService = bedrock-agentcore.<region>.amazonaws.com`. Forgetting the
+> gardener shows up as `AccessDeniedException: Missing permission for
+> encryption key` on `ListMemoryRecords`.
+
 ---
 
 ## Troubleshooting
