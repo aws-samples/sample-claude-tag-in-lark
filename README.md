@@ -59,17 +59,19 @@ practices and standards.
 
 ## Architecture
 
-![Architecture](docs/architecture.png)
+![Architecture](docs/architecture-animated.svg)
 
-<sub>Reactive path (black, steps ①–⑤): @-mention → API Gateway → webhook Lambda →
-AgentCore Runtime → model (LiteLLM gateway → Bedrock) / memory / skills / Exa →
-SSE deltas → CardKit reply in-thread.
+<sub>Animated, left-to-right view — open the SVG to watch the flows move (official
+AWS service icons, self-contained, no external assets). Reactive path (blue, steps
+①–⑤): @-mention → API Gateway → webhook Lambda → AgentCore Runtime → LiteLLM gateway
+→ Bedrock; SSE deltas stream back (teal) as a CardKit reply in-thread.
 Scheduling path (green): 1-minute EventBridge heartbeat → dispatcher → claim due
 jobs in DynamoDB → ask the webhook to deliver.
-Ambient path (blue): hourly EventBridge → consolidator → pull non-@ messages from
-Lark → distill durable facts (Haiku, direct to Bedrock) into per-channel memory.
-Diagram source: `docs/architecture.drawio` (edit in [draw.io](https://www.drawio.com/),
-export to `architecture.png`).</sub>
+Ambient path (violet): hourly EventBridge → consolidator → pull non-@ messages from
+Lark → distill durable facts (Haiku → Bedrock) into per-channel memory. A weekly
+gardener (amber) prunes the auto memory layer.
+A static draw.io version is also kept at `docs/architecture.drawio` (edit in
+[draw.io](https://www.drawio.com/), export to `architecture.png`).</sub>
 
 | Layer | Path |
 |-------|------|
