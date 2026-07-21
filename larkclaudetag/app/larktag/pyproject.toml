@@ -24,7 +24,7 @@ dependencies = [
     "openpyxl >= 3.1.5",
     "pypdf >= 5.1.0",
     "matplotlib >= 3.9.0",
-    "pillow >= 10.4.0",      # pptx thumbnail.py (PIL) self-check rendering
+    "pillow>=12.3.0",      # pptx thumbnail.py (PIL) self-check rendering
 ]
 
 [tool.hatch.build.targets.wheel]
