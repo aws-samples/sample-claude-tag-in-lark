@@ -32,12 +32,22 @@ so build the dependencies before the things that consume them.
 **Accounts / services you must provide:**
 
 1. **An AWS account + region** with Amazon Bedrock AgentCore available, and
-   Bedrock model access enabled for the Claude model you target (the sample uses
-   cross-region inference, model id `global.anthropic.claude-opus-4-8`).
-2. **An Anthropic-format model endpoint that fronts Bedrock.** The sample was
-   built against a **LiteLLM gateway** exposing the `/v1/messages` API, but any
-   gateway that speaks the Anthropic Messages API and routes to Bedrock works.
-   You need its base URL, an API key, and the model alias it exposes.
+   Bedrock model access enabled for the Claude model you target. The sample uses
+   cross-region inference throughout: `global.anthropic.claude-opus-4-8` behind the
+   gateway, `global.anthropic.claude-opus-5` as the `bedrock` default.
+2. **A model backend.** `MODEL_BACKEND` picks one of three (see
+   [Model backends](../README.md#model-backends)); which prerequisite applies
+   depends on the choice:
+   - **`litellm`** (default): an Anthropic-format endpoint that fronts Bedrock. The
+     sample was built against a **LiteLLM gateway** exposing `/v1/messages`, but any
+     gateway that speaks the Anthropic Messages API and routes to Bedrock works. You
+     need its base URL, an API key, and the model alias it exposes.
+   - **`bedrock`** / **`mantle`**: nothing extra to run. Bedrock model access on the
+     account covers it, and the Runtime execution role carries the authorization
+     (Step 5). Submit the Bedrock **use case form** once per account, from the model
+     catalog in the Bedrock console, before the first invocation. For `mantle`,
+     confirm with your AWS account team that your account is granted the model —
+     Mantle's lineup is separate from the Bedrock catalog.
 3. **A Lark (Feishu) self-built app** — see [Step 7](#step-7--lark-console). You
    need its `app_id`, `app_secret`, `encrypt_key`, and `verification_token`.
 4. **An Exa API key** ([exa.ai](https://exa.ai)) for the web-search tool.
@@ -107,9 +117,6 @@ Create a secret whose JSON value holds:
 
 ```json
 {
-  "ANTHROPIC_BASE_URL": "<your gateway base URL, e.g. http://litellm.internal>",
-  "ANTHROPIC_API_KEY": "<your gateway API key>",
-  "LITELLM_MODEL": "claude-opus-4-8",
   "AGENTCORE_MEMORY_ID": "<from Step 1>",
   "SKILL_BUCKET": "<SKILL_BUCKET_NAME from Step 2>",
   "SCHEDULE_TABLE_NAME": "lark-claude-tag-schedules",
@@ -120,6 +127,76 @@ Create a secret whose JSON value holds:
   "LARK_OPEN_BASE": "https://open.larksuite.com"
 }
 ```
+
+Then configure your model backend. `MODEL_BACKEND` selects one; omitting it means
+`litellm`. See the [Model backends](../README.md#model-backends) table for what each
+one is, and `larkclaudetag/app/larktag/model_backend.py` for the full env-var mapping.
+
+> **Where to put the backend switch.** `MODEL_BACKEND` and the model id are not
+> secrets, so they don't have to live in Secrets Manager. Putting them in the
+> Runtime's own `envVars` keeps the secret for actual credentials and makes the
+> switch visible in `agentcore.json`:
+>
+> ```json
+> "runtimes": [{
+>   "name": "larktag",
+>   "envVars": [
+>     { "name": "MODEL_BACKEND", "value": "bedrock" },
+>     { "name": "BEDROCK_MODEL", "value": "global.anthropic.claude-opus-5" }
+>   ]
+> }]
+> ```
+>
+> Either place works: `runtime_config.py` loads the secret with `setdefault`, so an
+> explicitly-set env var always wins over the same key in the secret. On the Bedrock
+> backends this means switching backends never touches the secret at all.
+
+**`litellm`** — a gateway in front of Bedrock (the configuration this sample ships):
+
+```json
+{
+  "MODEL_BACKEND": "litellm",
+  "ANTHROPIC_BASE_URL": "<your gateway base URL, e.g. http://litellm.internal>",
+  "ANTHROPIC_API_KEY": "<your gateway API key>",
+  "LITELLM_MODEL": "claude-opus-4-8"
+}
+```
+
+**`bedrock`** — the Bedrock Invoke API directly. No URL and no key: the `claude`
+CLI signs its requests with the Runtime execution role, so the model access lives
+in IAM (Step 5) instead of in this secret.
+
+```json
+{
+  "MODEL_BACKEND": "bedrock",
+  "BEDROCK_MODEL": "global.anthropic.claude-opus-5"
+}
+```
+
+`BEDROCK_MODEL` is optional and defaults to the value above. It must be a
+**cross-region inference profile id** (or an application inference profile ARN) —
+a bare foundation-model id fails these models with "on-demand throughput isn't
+supported". The `global.` prefix lets Bedrock serve from whichever region has
+capacity; append `[1m]` to the id to request the 1M-token context window. First
+use in an account also needs the Bedrock **use case form** submitted once, from the
+model catalog in the Bedrock console.
+
+**`mantle`** — Bedrock's Mantle endpoint: same AWS credentials and IAM as
+`bedrock`, but the native Anthropic API shape, so betas and server-side tools are
+not stripped.
+
+```json
+{
+  "MODEL_BACKEND": "mantle",
+  "MANTLE_MODEL": "anthropic.claude-opus-5"
+}
+```
+
+> Mantle model ids carry an `anthropic.` prefix with no version suffix and **no
+> region prefix**; an inference profile id such as `global.anthropic.claude-opus-5`
+> returns 400 there. Mantle also has its own model lineup, granted per account —
+> a 403 with valid credentials means your account has not been granted that model.
+> Confirm availability with your AWS account team before picking this backend.
 
 ```bash
 aws secretsmanager create-secret \
@@ -148,9 +225,20 @@ used by the scheduled-tasks tools — set it now so it's present when the image 
 3. Deploy:
 
    ```bash
-   cd larkclaudetag/agentcore
+   cd larkclaudetag          # the agentcore project root, NOT agentcore/
    agentcore deploy
    ```
+
+   > The CLI resolves its project root from `agentcore/agentcore.json` and refuses
+   > to run from inside `agentcore/` itself. It also gates on the CDK versions in
+   > `agentcore/cdk/package.json`: if a dependency bump has moved `aws-cdk-lib`
+   > ahead of what your CLI was tested against, `deploy` stops with "This project
+   > requires a newer version of the AgentCore CLI". Upgrade the CLI
+   > (`npm install -g @aws/agentcore@preview`), or, when the CLI is already at the
+   > newest preview and you intend to keep the newer library, take ownership of the
+   > versions with `agentcore config disableDependencyManagement true`. Prefer
+   > either of those over downgrading `aws-cdk-lib`, which would give back whatever
+   > Dependabot fix raised it.
 
    This builds the container in CodeBuild (ARM64), pushes to ECR, and creates the
    Runtime via CDK. **Record the Runtime ARN** it prints — it's the
@@ -168,6 +256,21 @@ used by the scheduled-tasks tools — set it now so it's present when the image 
 | `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` | the skills bucket (+ `/*`) | self-evolving skill store |
 | `dynamodb:PutItem`, `dynamodb:Query`, `dynamodb:UpdateItem` | the schedules table (+ `/index/*`) | scheduled-tasks tools (create / list / cancel) |
 
+**On the `bedrock` and `mantle` backends, also grant model access** — this is what
+replaces the gateway API key, so without it every turn fails with
+`AccessDeniedException`:
+
+| Action(s) | Resource | Why |
+|-----------|----------|-----|
+| `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` | the inference profiles you use (+ their backing `foundation-model/*`) | the `claude` CLI calls Bedrock with this role's credentials |
+| `bedrock:ListInferenceProfiles`, `bedrock:GetInferenceProfile` | `inference-profile/*`, `application-inference-profile/*` | lets the CLI resolve a profile to its backing model and pick the right request shape; without it requests still work but each new model costs an extra round-trip |
+
+> Scope the resources to the profile ARNs this agent should reach rather than `*`.
+> A cross-region profile fans out across regions, so allow the backing
+> `foundation-model` ARNs in each region the profile can serve from — for `global.`
+> profiles that is why the resource list is broader than a single-region deployment
+> would need.
+
 > Attach these as a **separate inline policy** so a later `agentcore deploy` (which
 > regenerates the CDK-managed default policy) doesn't drop them.
 
@@ -176,23 +279,39 @@ used by the scheduled-tasks tools — set it now so it's present when the image 
 > `bedrock-agentcore` memory actions on the Memory ARN — granting them on the IAM
 > role alone is not enough.
 
-## Step 6 — Open egress to your model gateway
+## Step 6 — Open egress to the model endpoint
 
-The Runtime must reach: your model gateway, `mcp.exa.ai`,
-`knowledge-mcp.global.api.aws`, and your `LARK_OPEN_BASE` host. If your gateway
-sits behind a security-group-restricted load balancer, add the Runtime's egress
-(its NAT IP `/32`, or its security group) to the gateway's inbound rule.
+The Runtime must reach `mcp.exa.ai`, `knowledge-mcp.global.api.aws`, your
+`LARK_OPEN_BASE` host, and — depending on the backend — one of:
 
-> **Never** open the gateway to `0.0.0.0/0`. Allowlist the specific egress source.
+- **`litellm`**: your model gateway. If it sits behind a security-group-restricted
+  load balancer, add the Runtime's egress (its NAT IP `/32`, or its security group)
+  to the gateway's inbound rule.
+  > **Never** open the gateway to `0.0.0.0/0`. Allowlist the specific egress source.
+- **`bedrock`**: `bedrock-runtime.<region>.amazonaws.com`. In VPC mode, prefer a
+  **`bedrock-runtime` VPC interface endpoint** over public egress and point the
+  agent at it with `ANTHROPIC_BEDROCK_BASE_URL` in the runtime secret; the
+  endpoint's security group must accept the Runtime's, and its endpoint policy must
+  allow the `bedrock:InvokeModel*` actions from Step 5.
+- **`mantle`**: the Mantle endpoint, which the CLI derives from the region.
+  Override with `ANTHROPIC_BEDROCK_MANTLE_BASE_URL` if you route it through a
+  gateway of your own.
+
+There is no inbound rule to manage on either Bedrock backend — access is decided
+by IAM (Step 5), not by network position.
 
 ## Step 7 — Validate the Runtime directly (before wiring the Lambda)
 
 Confirm the agent works end-to-end through the gateway before adding the webhook:
 
 ```bash
-cd larkclaudetag/agentcore
+cd larkclaudetag          # the agentcore project root, NOT agentcore/
 agentcore invoke '{"prompt": "Search the web for the latest AWS news and summarize it."}'
 ```
+
+Check the Runtime log group for the startup line `Model backend: <name> | model: <id>`
+— it reports which backend the container actually resolved, which is the fastest way
+to confirm a `MODEL_BACKEND` change took effect.
 
 You should get streamed text back and see a tool fire (Exa / AWS Knowledge). This
 proves function-calling survives the gateway→Bedrock path. Only then continue.
@@ -360,7 +479,33 @@ reason. Manual invocations accept `{"dry_run": true}` (report without applying),
   allow the `bedrock-agentcore` memory actions on your Memory ARN (Step 5 note).
 - **Gateway connection refused/timeout from the Runtime.** Egress isn't
   allowlisted on the gateway (Step 6), or PUBLIC/VPC networking is misconfigured.
-- **`budget_tokens` / server-side tools / `effort` not working.** A Bedrock-backed
-  gateway runs pseudo-passthrough and silently drops betas, built-in server tools,
-  and `budget_tokens`. Use only client-side tools (MCP / `@tool`) and local
-  skills; keep thinking adaptive or off.
+- **`budget_tokens` / server-side tools / `effort` not working.** The Bedrock
+  Invoke API runs pseudo-passthrough and silently drops betas, built-in server
+  tools, and `budget_tokens` — on the `litellm` and `bedrock` backends alike. Use
+  only client-side tools (MCP / `@tool`) and local skills; keep thinking adaptive
+  or off. The `mantle` backend serves the native Anthropic shape and does not strip
+  them, if you need them.
+- **Container exits at startup with `MODEL_BACKEND=... is not a known backend`.**
+  A typo in the secret. Valid values are `litellm`, `bedrock`, `mantle`. This is
+  deliberate: a misconfigured backend fails the container instead of quietly
+  serving traffic on a backend nobody selected.
+- **Switched `MODEL_BACKEND` but the old backend still serves traffic.** Check the
+  Runtime log line at startup — `Model backend: <name> | model: <id>` reports what
+  the container actually resolved. If it still says `litellm`, the new secret value
+  didn't reach the container (secret not updated, or the Runtime not redeployed).
+- **`AccessDeniedException` on every turn after switching to `bedrock`/`mantle`.**
+  The runtime role is missing `bedrock:InvokeModel` /
+  `InvokeModelWithResponseStream` (Step 5), or the resource ARNs don't cover the
+  profile you pinned. On the two Bedrock backends this is the failure that replaces
+  "bad gateway API key".
+- **`on-demand throughput isn't supported`.** `BEDROCK_MODEL` is a bare
+  foundation-model id. Use a cross-region inference profile id such as
+  `global.anthropic.claude-opus-5`, or an application inference profile ARN.
+- **`400` naming the model id on `mantle`.** That model isn't served on Mantle,
+  whose lineup is separate from the Bedrock catalog — inference profile ids don't
+  work there. Use an `anthropic.`-prefixed id. A **`403`** with valid credentials
+  means the account hasn't been granted that model; ask your AWS account team.
+- **Streaming fails with `Bedrock streaming response has content-type ...`.** Only
+  when `ANTHROPIC_BEDROCK_BASE_URL` points at a proxy: something between the
+  Runtime and Bedrock is rewriting the binary `application/vnd.amazon.eventstream`
+  response. Pass the streaming body and its `Content-Type` through unmodified.

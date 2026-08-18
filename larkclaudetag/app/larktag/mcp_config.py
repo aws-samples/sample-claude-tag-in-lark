@@ -1,7 +1,8 @@
 """External MCP server wiring: Exa (web search) + AWS Knowledge + AWS pricing.
 
-All are client-side tool calls (survive LiteLLM->Bedrock pseudo-passthrough,
-unlike the built-in server-side WebSearch which Bedrock drops).
+All are client-side tool calls, so they work on every model backend. The built-in
+server-side WebSearch does not: Bedrock drops it, whether reached through a
+gateway or directly (see model_backend.py) — hence Exa for search instead.
 
 Returns (mcp_servers, allowed_tools) to merge into ClaudeAgentOptions alongside
 the in-process Lark SDK MCP server (see tools.py).
