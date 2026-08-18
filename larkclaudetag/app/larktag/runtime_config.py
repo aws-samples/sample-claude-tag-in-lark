@@ -7,10 +7,19 @@ runtime exec role needs secretsmanager:GetSecretValue on that secret.
 Imported FIRST in main.py (before `import memory`, which reads AGENTCORE_MEMORY_ID
 at module load). Uses setdefault so any explicitly-set env var wins.
 
-Secret JSON is expected to hold:
-  ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, LITELLM_MODEL, AGENTCORE_MEMORY_ID,
-  SKILL_BUCKET, SCHEDULE_TABLE_NAME, EXA_API_KEY,
+Secret JSON is expected to hold, on every backend:
+  AGENTCORE_MEMORY_ID, SKILL_BUCKET, SCHEDULE_TABLE_NAME, EXA_API_KEY,
   AWS_KNOWLEDGE_MCP_URL, LARK_APP_ID, LARK_APP_SECRET, LARK_OPEN_BASE
+
+plus the keys for the model backend named by MODEL_BACKEND (see model_backend.py):
+  litellm (default) — ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, LITELLM_MODEL
+  bedrock           — BEDROCK_MODEL (optional; the rest is IAM + the region)
+  mantle            — MANTLE_MODEL (optional; same)
+
+The Bedrock backends hold no model credentials at all: the `claude` CLI signs its
+own requests with the Runtime execution role, so the only model config left in the
+secret is which model id to ask for.
+
 (extra keys such as a legacy MEMORY_SEMANTIC_STRATEGY_ID are exported but unused)
 """
 

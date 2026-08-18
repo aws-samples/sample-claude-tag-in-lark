@@ -1,16 +1,19 @@
 """AgentCore Runtime entrypoint — Claude Agent SDK agent for the Lark teammate.
 
-Backend: LiteLLM gateway (Anthropic /v1/messages format) -> Bedrock provider.
-  ANTHROPIC_BASE_URL = LiteLLM ALB, ANTHROPIC_API_KEY = LiteLLM key,
-  model = the alias configured in the gateway (LITELLM_MODEL).
+Backend: chosen by MODEL_BACKEND — `litellm` (a gateway in front of Bedrock; the
+default), `bedrock` (the Bedrock Invoke API directly) or `mantle` (Bedrock's
+native-Anthropic-shape endpoint). model_backend.py holds the whole mapping from
+backend name to the env vars the CLI subprocess needs.
 
 Key gotcha: the Claude Agent SDK spawns the `claude` CLI as a subprocess; the
 SDK's *bundled* CLI binary ignores ANTHROPIC_BASE_URL, so we force the
 system-installed CLI via cli_path. (See known issue anthropics/claude-agent-sdk-python#677.)
 
-Tools/skills are all client-side (survive Bedrock pseudo-passthrough): in-process
-Lark SDK MCP server + external MCP (Exa / AWS Knowledge / pricing) + Claude Code
-skills loaded from ./.claude/skills. No built-in server tools, no betas.
+Tools/skills are all client-side: in-process Lark SDK MCP server + external MCP
+(Exa / AWS Knowledge / pricing) + Claude Code skills loaded from ./.claude/skills.
+No built-in server tools, no betas — the Invoke API is a pseudo-passthrough that
+drops both, on `litellm` and `bedrock` alike. (`mantle` does not have that limit,
+but the tool surface here stays client-side so one agent runs on any backend.)
 
 Latency design — WARM CLIENT REUSE:
   Spawning the `claude` CLI subprocess and (re)connecting all MCP servers costs
@@ -45,6 +48,7 @@ from claude_agent_sdk import (
 )
 
 import memory
+import model_backend
 from mcp_config import build_external_mcp
 from prompts import SYSTEM_PROMPT
 from tools import (
@@ -61,8 +65,12 @@ logger = logging.getLogger(__name__)
 
 app = BedrockAgentCoreApp()
 
-MODEL = os.environ.get("LITELLM_MODEL", "claude-opus-4-8")
-logger.info("LiteLLM model in use: %s", MODEL)
+# Resolved once at import, after runtime_config has populated os.environ from the
+# secret. An unknown MODEL_BACKEND raises here, failing the container at startup
+# rather than serving traffic on a backend nobody selected.
+BACKEND = model_backend.resolve()
+MODEL = BACKEND.model
+logger.info("Model backend: %s | model: %s", BACKEND.name, MODEL)
 APP_DIR = os.environ.get("AGENT_APP_DIR", "/app")
 # Skill workflows (e.g. html2pptx: write HTML, run scripts, render, deliver) take
 # many tool turns — 20 was far too low and cut PPT generation off mid-way.
@@ -94,12 +102,11 @@ def _build_options() -> ClaudeAgentOptions:
     )
     if _CLI_PATH:
         kwargs["cli_path"] = _CLI_PATH
-    # Ensure the subprocess CLI sees the LiteLLM endpoint even if the parent env
-    # is partially set; ClaudeAgentOptions.env is forwarded to the CLI process.
-    kwargs["env"] = {
-        "ANTHROPIC_BASE_URL": os.environ.get("ANTHROPIC_BASE_URL", ""),
-        "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", ""),
-    }
+    # Point the CLI subprocess at the selected backend. ClaudeAgentOptions.env is
+    # merged over this process's os.environ, so on the Bedrock backends the AWS
+    # credentials AgentCore injects are inherited for free and only the backend
+    # switches need naming here (see model_backend.py).
+    kwargs["env"] = dict(BACKEND.env)
     return ClaudeAgentOptions(**kwargs)
 
 
@@ -226,7 +233,8 @@ def _build_prompt(text: str, mem_snippets: list[str], recent: list[str] | None =
 
 async def _multimodal_message(text: str, images: list[dict], session_id: str):
     """Yield a single streaming-input user message with text + base64 image blocks.
-    LiteLLM /v1/messages -> Bedrock only accepts base64 image sources (not url)."""
+    Bedrock rejects url image sources, on the Invoke API and behind a gateway
+    alike, so images are always inlined as base64 whatever the backend."""
     content: list[dict] = []
     if text:
         content.append({"type": "text", "text": text})

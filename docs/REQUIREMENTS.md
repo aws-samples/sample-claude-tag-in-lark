@@ -7,9 +7,10 @@ lives in Slack channels: @-mention it to delegate a task and it breaks the work
 down, uses tools, and replies in-thread. It is Slack-only and gated behind a
 Claude Enterprise/Team subscription.
 
-This sample reproduces the core experience on **Lark (Feishu)**, served by a
-**LiteLLM gateway** in front of Amazon Bedrock (pseudo-passthrough), so it runs
-without a Claude subscription. It also adds a self-evolving memory + skill loop on
+This sample reproduces the core experience on **Lark (Feishu)**, served from Amazon
+Bedrock, so it runs without a Claude subscription. `MODEL_BACKEND` selects the path
+to Bedrock: a **LiteLLM gateway** (default), the **Bedrock Invoke API** directly, or
+Bedrock's **Mantle** endpoint. It also adds a self-evolving memory + skill loop on
 top of the original feature set.
 
 ## Feature breakdown
@@ -26,7 +27,7 @@ The table maps Claude Tag's described capabilities to what this sample implement
 | 6 | **Distinct identity** | Its own identity, with permissions and memory scoped per channel. | Partial (the bot has its own tenant identity; memory is isolated by `chat_id`) |
 | 7 | **Tools / connectors** | Connects to codebases, data, and external tools. | **Implemented**: Exa web search + AWS Knowledge/pricing MCP + Lark capabilities (docs/wiki/calendar) + document skills (PPT/Word/Excel/PDF) + frontend design |
 | 8 | **Admin governance** | Permission scoping, token budgets (org + channel), audit logs. | Future (out of scope for the sample) |
-| 9 | **Runs on Opus** | — | Served via the Opus 4.8 alias on the LiteLLM gateway |
+| 9 | **Runs on Opus** | — | Opus on every backend: the Opus 4.8 alias on the LiteLLM gateway, or `global.anthropic.claude-opus-5` / `anthropic.claude-opus-5` on Bedrock direct |
 
 ## Acceptance criteria (implemented)
 
@@ -37,7 +38,7 @@ The table maps Claude Tag's described capabilities to what this sample implement
 3. It can search the web (Exa), create Lark docs / query wiki / check calendar, and
    produce PPT/Word/Excel/PDF deliverables.
 4. Full path works end-to-end: Lark group @-mention → AgentCore Runtime (Claude
-   Agent SDK + LiteLLM) → in-thread reply.
+   Agent SDK + the configured model backend) → in-thread reply.
 5. Scheduling: a chat instruction creates a one-shot / recurring / count- or
    deadline-bounded job that fires on time and @-mentions its creator; recurring
    jobs are read back for confirmation before creation, and stop exactly on their
@@ -50,11 +51,13 @@ The table maps Claude Tag's described capabilities to what this sample implement
 
 ## Key technical constraints
 
-- **The LiteLLM backend is a Bedrock provider (pseudo-passthrough).** Built-in
-  server-side tools (web search, code execution), the `effort` beta, and the
-  deprecated `budget_tokens` parameter are silently dropped. → Use only
-  client-side function-calling tools + MCP + Claude Code-style local skills; enable
-  no betas; keep thinking adaptive or off.
+- **The Bedrock Invoke API is a pseudo-passthrough.** Built-in server-side tools
+  (web search, code execution), the `effort` beta, and the deprecated
+  `budget_tokens` parameter are silently dropped — through a gateway (`litellm`) and
+  directly (`bedrock`) alike. → Use only client-side function-calling tools + MCP +
+  Claude Code-style local skills; enable no betas; keep thinking adaptive or off.
+  The `mantle` backend serves the native Anthropic shape and lifts this constraint,
+  but the agent's tool surface stays client-side so it runs on any backend.
 - **The Claude Agent SDK spawns the `claude` CLI as a subprocess.** The runtime
   needs Node.js + the `claude` binary, and the SDK's bundled binary has a known
   issue where it ignores `ANTHROPIC_BASE_URL` — so force the system CLI with

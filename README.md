@@ -2,8 +2,10 @@
 
 A **Lark (飞书) port of Anthropic's Claude Tag** — an always-on AI teammate that
 lives in group chats. Built on **Amazon Bedrock AgentCore** + the **Claude Agent
-SDK**, with the model served through a **LiteLLM gateway** (→ Bedrock), so it runs
-without a Claude Enterprise subscription.
+SDK**, so it runs without a Claude Enterprise subscription. The model reaches
+Bedrock one of three ways, picked with `MODEL_BACKEND`: through a **LiteLLM
+gateway** (default), **directly via the Bedrock Invoke API**, or through
+**Bedrock's Mantle endpoint** — see [Model backends](#model-backends).
 
 > Claude Tag itself is Slack-only and Enterprise/Team-subscription-only. This
 > sample reproduces its core experience on Lark and adds a self-evolving memory +
@@ -64,7 +66,9 @@ practices and standards.
 <sub>Animated, left-to-right view — open the SVG to watch the flows move (official
 AWS service icons, self-contained, no external assets). Reactive path (blue, steps
 ①–⑤): @-mention → API Gateway → webhook Lambda → AgentCore Runtime → LiteLLM gateway
-→ Bedrock; SSE deltas stream back (teal) as a CardKit reply in-thread.
+→ Bedrock; SSE deltas stream back (teal) as a CardKit reply in-thread. The diagram
+shows the default `litellm` backend; on `bedrock` / `mantle` step ⑤ goes straight
+from the Runtime to Bedrock with no gateway hop (see [Model backends](#model-backends)).
 Scheduling path (green): 1-minute EventBridge heartbeat → dispatcher → claim due
 jobs in DynamoDB → ask the webhook to deliver.
 Ambient path (violet): hourly EventBridge → consolidator → pull non-@ messages from
@@ -85,14 +89,53 @@ A static draw.io version is also kept at `docs/architecture.drawio` (edit in
 
 The Lambda is a thin webhook adapter (verify/decrypt/dedup/ack/async); all agent
 work happens in the AgentCore Runtime container running the Claude Agent SDK
-against the LiteLLM gateway.
+against whichever model backend is configured.
+
+## Model backends
+
+`MODEL_BACKEND` selects how the agent's `claude` CLI subprocess reaches a model.
+The whole mapping lives in one module, `larkclaudetag/app/larktag/model_backend.py`.
+
+| `MODEL_BACKEND` | Transport | Auth | Model id |
+|-----------------|-----------|------|----------|
+| `litellm` (default) | LiteLLM gateway, Anthropic `/v1/messages` shape → Bedrock | gateway API key | `LITELLM_MODEL` — a gateway alias, e.g. `claude-opus-4-8` |
+| `bedrock` | Bedrock Invoke API, direct | AWS SigV4 | `BEDROCK_MODEL` — a cross-region inference profile id, default `global.anthropic.claude-opus-5` |
+| `mantle` | Bedrock Mantle endpoint, native Anthropic shape | AWS SigV4 | `MANTLE_MODEL` — an `anthropic.`-prefixed id, default `anthropic.claude-opus-5` |
+
+**The two Bedrock backends hold no model credentials at all.** The CLI signs its
+own requests with the credentials it inherits from the container, which on
+AgentCore Runtime are the execution role's — no gateway to operate, no load
+balancer to allowlist, no model API key in Secrets Manager. What they need instead
+is `bedrock:InvokeModel` + `bedrock:InvokeModelWithResponseStream` on the runtime
+role (runbook Step 5) and egress to the Bedrock endpoint (Step 6).
+
+Choosing between them:
+
+- **`litellm`** when a gateway already exists and you want its central key
+  management, per-team quota and request logging.
+- **`bedrock`** for the shortest path — one less hop to run, secure and pay for.
+  The capability envelope matches `litellm`: the Invoke API is a
+  pseudo-passthrough, so betas and built-in server tools are dropped either way.
+- **`mantle`** when you want the native Anthropic request shape, which does not
+  strip betas or server-side tools. Its model lineup is separate from the Bedrock
+  catalog and access is granted per account, so confirm availability with your AWS
+  account team first; an inference profile id such as
+  `global.anthropic.claude-opus-5` returns 400 on Mantle.
+
+Switching backends is a config change, not a code change: set `MODEL_BACKEND` and
+the one model id in the runtime secret, then redeploy. An unknown value fails the
+container at startup instead of quietly falling back to another backend. To check a
+backend before deploying, run `tests/smoke_model_backend.py` against it — it
+resolves the backend through the same module the Runtime uses.
 
 ## Key design constraints (important)
 
-- **LiteLLM backend is a Bedrock provider (pseudo-passthrough):** built-in
-  server-side tools (WebSearch, code_execution), the `effort` beta, and
-  `budget_tokens` are silently dropped. → only **client-side** tools (MCP /
-  `@tool`) + **Claude Code-style local skills**; no betas; thinking adaptive or off.
+- **Bedrock via the Invoke API is a pseudo-passthrough** (both `litellm` and
+  `bedrock`): built-in server-side tools (WebSearch, code_execution), the `effort`
+  beta, and `budget_tokens` are silently dropped. → only **client-side** tools
+  (MCP / `@tool`) + **Claude Code-style local skills**; no betas; thinking adaptive
+  or off. The tool surface stays client-side on `mantle` too, which doesn't have
+  this limit, so one agent runs unchanged on any backend.
 - **Claude Agent SDK spawns the `claude` CLI subprocess** (needs Node + the CLI
   in the container) and its bundled binary ignores `ANTHROPIC_BASE_URL` → force
   `cli_path=shutil.which("claude")`.
@@ -107,7 +150,7 @@ against the LiteLLM gateway.
 
 | Item | Where |
 |------|-------|
-| **LiteLLM** ALB URL + key + model **alias** | Runtime config secret `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` / `LITELLM_MODEL` |
+| **A model backend** — on `litellm`, the gateway URL + key + model alias; on `bedrock` / `mantle`, only Bedrock model access in your account (no key) | Runtime config secret: `MODEL_BACKEND` + `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` / `LITELLM_MODEL`, or `BEDROCK_MODEL`, or `MANTLE_MODEL` |
 | **Lark self-built app**: app_id/secret/encrypt_key/verification_token; scopes `im:message`, `im:message:send_as_bot`, `im:resource`, `cardkit:card:read/write`, `docx:document`; subscribe `im.message.receive_v1` | Secrets Manager + Runtime config |
 | **Exa API key** | Runtime config secret `EXA_API_KEY` |
 | **AWS account/region** + AgentCore Memory id (+ semantic strategy id, for the SAM consolidator parameter only) | `create_memory.py` → Runtime config secret `AGENTCORE_MEMORY_ID`; strategy id → SAM `MemorySemanticStrategyId` |
@@ -120,25 +163,35 @@ See [`docs/DEPLOY_RUNBOOK.md`](docs/DEPLOY_RUNBOOK.md) for the full deploy seque
 
 ## Status
 
-Deployed and verified end-to-end on AgentCore Runtime: streaming replies via
-LiteLLM→Bedrock, per-channel memory (explicit `remember`/`forget` + async
+Deployed and verified end-to-end on AgentCore Runtime **on the `litellm` backend**:
+streaming replies via LiteLLM→Bedrock, per-channel memory (explicit `remember`/`forget` + async
 extraction), self-evolving skill save/sync, document-skill file delivery,
 multimodal image input, and scheduled tasks/reminders (one-shot, recurring,
 count- and deadline-bounded; `remind` and `agent` modes). Per-channel memory
 isolation and global skill sharing are intentional and confirmed.
 
+The `bedrock` and `mantle` backends are wired and locally verified (backend
+resolution, the env handed to the CLI, and the client-side tool smoke test) but
+have not yet been run end-to-end on the Runtime. Validate with runbook Step 7
+after switching.
+
 ## Security
 
-- **No secrets in the repo.** All credentials (Lark app secret/encrypt key, model
-  gateway key, Exa key) live in AWS Secrets Manager and are fetched at runtime.
-  Replace every `<PLACEHOLDER>` in the config before deploying.
+- **No secrets in the repo.** All credentials (Lark app secret/encrypt key, the
+  model gateway key on the `litellm` backend, Exa key) live in AWS Secrets Manager
+  and are fetched at runtime. Replace every `<PLACEHOLDER>` in the config before
+  deploying. The `bedrock` and `mantle` backends remove the model credential
+  entirely — the runtime role's IAM permissions take its place.
 - **The webhook verifies and decrypts** every Lark event (signature + encrypted
   payload + verification token) before processing.
 - **The agent runs untrusted-ish multi-step work** (`bypassPermissions` so skills
   can run Bash/Write in a headless container) — it is the network-isolated tier
   (VPC mode), while the webhook Lambda is a thin public adapter.
-- Restrict model-gateway ingress to the Runtime's specific egress; never use
-  `0.0.0.0/0`.
+- On the `litellm` backend, restrict model-gateway ingress to the Runtime's
+  specific egress; never use `0.0.0.0/0`. On the Bedrock backends there is no
+  ingress to restrict — scope the runtime role's `bedrock:InvokeModel*` to the
+  inference profiles it should reach instead, and prefer a `bedrock-runtime` VPC
+  interface endpoint over public egress in VPC mode.
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for how to report
 a security issue.
