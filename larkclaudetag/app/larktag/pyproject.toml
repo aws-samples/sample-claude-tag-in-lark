@@ -22,7 +22,7 @@ dependencies = [
     "python-pptx >= 1.0.2",
     "python-docx >= 1.1.2",
     "openpyxl >= 3.1.5",
-    "pypdf >= 5.1.0",
+    "pypdf>=6.15.0",
     "matplotlib >= 3.9.0",
     "pillow >= 10.4.0",      # pptx thumbnail.py (PIL) self-check rendering
 ]
